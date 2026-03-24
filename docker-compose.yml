@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  web:
+    image: fevirtus/reader:v0.0.1
+    container_name: reader-web
+    ports:
+      - "3003:3000"
+    environment:
+      # KHÔNG SỬ DỤNG DẤU NGOẶC KÉP "" TRONG DOCKER COMPOSE
+      - DATABASE_URL=postgresql://reader:reader%40123@master-02:5432/reader?schema=public
+      - MONGODB_URI=mongodb://root:virtus%40123@master-02:27017/reader?authSource=admin
+      - NEXTAUTH_SECRET=your-super-secret-key
+      # Sửa thành domain name thực tế bạn đang truy cập
+      - NEXTAUTH_URL=http://master-02:3003
+      - GOOGLE_CLIENT_ID=752734667309-khhufui27coorhmk8gh15epbpbeerg25.apps.googleusercontent.com
+      - GOOGLE_CLIENT_SECRET=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
+    volumes:
+      - ./uploads:/app/public/uploads
+    restart: unless-stopped

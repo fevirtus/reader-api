@@ -1,0 +1,188 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// NextAuth schema
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  role          Role      @default(USER) // Bổ sung phân quyền, mặc định là USER
+
+  accounts      Account[]
+  sessions      Session[]
+  comments      Comment[]
+  bookmarks     Bookmark[]
+  novels        Novel[]   @relation("AuthorNovels") // Truyện do người này (MOD/ADMIN) đăng
+  settings      UserSetting?
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model UserSetting {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  fontSize      Float    @default(18)
+  lineHeight    Float    @default(1.8)
+  letterSpacing Float    @default(0)
+  fontFamily    String   @default("font-serif")
+
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Custom App Schema
+enum Role {
+  USER
+  MOD
+  ADMIN
+}
+
+model Novel {
+  id            String   @id @default(cuid())
+  title         String
+  originalTitle String?
+  slug          String   @unique
+  seriesId      String?
+  series        Series?  @relation(fields: [seriesId], references: [id], onDelete: SetNull)
+  authorName    String   // Tên tác giả nguyên bản của truyện
+  originalAuthorName String?
+  uploaderId    String?  // Tham chiếu đến User (Mod/Admin) đã upload
+  uploader      User?    @relation("AuthorNovels", fields: [uploaderId], references: [id], onDelete: SetNull)
+  description   String   @db.Text
+  coverColor    String?
+  coverUrl      String?
+  status        String   @default("Đang ra") // "Đang ra", "Hoàn thành", "Tạm ngưng"
+  totalChapters Int      @default(0)
+  views         Int      @default(0)
+  rating        Float    @default(0.0)
+  ratingCount   Int      @default(0)
+  bookmarkCount Int      @default(0)
+  trashWords    String[] @default([])
+  
+  genres        NovelGenre[]
+  comments      Comment[]
+  bookmarks     Bookmark[]
+  dailyViews    NovelViewDaily[]
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model NovelViewDaily {
+  id        String   @id @default(cuid())
+  novelId   String
+  day       DateTime @db.Date
+  views     Int      @default(0)
+
+  novel     Novel    @relation(fields: [novelId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([novelId, day])
+  @@index([day])
+}
+
+model Series {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique
+  description String?  @db.Text
+
+  novels      Novel[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Genre {
+  id          String       @id @default(cuid())
+  name        String       @unique
+  slug        String       @unique
+  description String?      @db.Text
+  icon        String?
+
+  novels      NovelGenre[]
+}
+
+// Cầu nối nhiều-nhiều giữa Novel và Genre
+model NovelGenre {
+  novelId String
+  genreId String
+
+  novel   Novel  @relation(fields: [novelId], references: [id], onDelete: Cascade)
+  genre   Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([novelId, genreId])
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  content   String   @db.Text
+  userId    String
+  novelId   String
+  chapterId String?  // Có thể bình luận riêng tư cho từng chương (Lưu chapterId từ MongoDB)
+  
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  novel     Novel    @relation(fields: [novelId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Bookmark {
+  id                String   @id @default(cuid())
+  userId            String
+  novelId           String
+  lastChapterId     String?
+  lastChapterNumber Int?
+  readChapters      Int[]    @default([])
+  hasCountedView    Boolean  @default(false)
+  
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  novel     Novel    @relation(fields: [novelId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([userId, novelId])
+}
