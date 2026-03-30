@@ -1,12 +1,14 @@
-# v0 runtime files
-__v0_runtime_loader.js
-__v0_devtools.tsx
-__v0_jsx-dev-runtime.ts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+dist/
+build/
 
-# Common ignores
-node_modules/
-.next/
-.env*.local
 .DS_Store
 .env
-test-ebook/
+.env.local
+# Local debug/test scripts
+test_*.py
