@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import random
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -21,6 +22,25 @@ from app.config import settings
 from app.database import get_db_session, mongo_client, mongo_db
 
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    mongo_client.close()
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+app.include_router(mod.router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 def _new_id(prefix: str = "") -> str:
     token = uuid.uuid4().hex
     return f"{prefix}{token}" if prefix else token
@@ -36,6 +56,376 @@ def _iso(value: Any) -> str | None:
     if isinstance(value, dt.date):
         return dt.datetime.combine(value, dt.time(0, 0, tzinfo=dt.timezone.utc)).isoformat()
     return str(value)
+
+
+def _shuffle_rows[T](rows: list[T]) -> list[T]:
+    copied = list(rows)
+    random.shuffle(copied)
+    return copied
+
+
+def _collapse_series_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    picked_series: set[str] = set()
+    output: list[dict[str, Any]] = []
+
+    for row in rows:
+        series_id = row.get("seriesId")
+        if not series_id:
+            output.append(row)
+            continue
+
+        if series_id in picked_series:
+            continue
+
+        picked_series.add(series_id)
+        output.append(row)
+
+    return output
+
+
+def _fill_unique_rows(rows: list[dict[str, Any]], fallback: list[dict[str, Any]], target: int) -> list[dict[str, Any]]:
+    picked: set[str] = set()
+    output: list[dict[str, Any]] = []
+
+    for row in [*rows, *fallback]:
+        row_id = str(row.get("id") or "")
+        if not row_id or row_id in picked:
+            continue
+        picked.add(row_id)
+        output.append(row)
+        if len(output) >= target:
+            return output
+
+    return output
+
+
+def _home_novel_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "slug": row["slug"],
+        "title": row["title"],
+        "authorName": row["authorName"],
+        "coverColor": row.get("coverColor"),
+        "coverUrl": row.get("coverUrl"),
+        "rating": float(row.get("rating") or 0),
+        "views": int(row.get("views") or 0),
+        "totalChapters": int(row.get("totalChapters") or 0),
+        "status": row.get("status") or "Đang ra",
+        "description": row.get("description") or "",
+        "bookmarkCount": int(row.get("bookmarkCount") or 0),
+        "seriesId": row.get("seriesId"),
+        "updatedAt": _iso(row.get("updatedAt")),
+    }
+
+
+async def _fetch_home_ranking_rows(
+    db: AsyncSession,
+    *,
+    since: dt.date | None = None,
+    take: int = 300,
+) -> list[dict[str, Any]]:
+    where_sql = 'WHERE v.day >= :since' if since else ''
+    params: dict[str, Any] = {"take": take}
+    if since:
+        params["since"] = since
+
+    rows = (
+        await db.execute(
+            text(
+                'SELECT n.id, n.slug, n.title, n."authorName", n."coverColor", n."coverUrl", '
+                'n.rating, n.views, n."totalChapters", n.status, n.description, n."bookmarkCount", '
+                'n."seriesId", n."updatedAt", COALESCE(SUM(v.views), 0)::int AS aggregated_views '
+                'FROM "NovelViewDaily" v '
+                'JOIN "Novel" n ON n.id = v."novelId" '
+                f'{where_sql} '
+                'GROUP BY n.id '
+                'ORDER BY aggregated_views DESC, n."updatedAt" DESC '
+                'LIMIT :take'
+            ),
+            params,
+        )
+    ).mappings().all()
+
+    return [
+        {
+            "id": row["id"],
+            "seriesId": row["seriesId"],
+            "aggregatedViews": int(row.get("aggregated_views") or 0),
+            "novel": _home_novel_from_row(dict(row)),
+        }
+        for row in rows
+    ]
+
+
+async def _fetch_home_popular_fallback(db: AsyncSession, *, take: int = 400) -> list[dict[str, Any]]:
+    rows = (
+        await db.execute(
+            text(
+                'SELECT id, slug, title, "authorName", "coverColor", "coverUrl", rating, views, '
+                '"totalChapters", status, description, "bookmarkCount", "seriesId", "updatedAt" '
+                'FROM "Novel" '
+                'ORDER BY views DESC, "updatedAt" DESC '
+                'LIMIT :take'
+            ),
+            {"take": take},
+        )
+    ).mappings().all()
+
+    return [
+        {
+            "id": row["id"],
+            "seriesId": row["seriesId"],
+            "aggregatedViews": int(row.get("views") or 0),
+            "novel": _home_novel_from_row(dict(row)),
+        }
+        for row in rows
+    ]
+
+
+async def _fetch_home_random_pool(db: AsyncSession, *, take: int = 420) -> list[dict[str, Any]]:
+    rows = (
+        await db.execute(
+            text(
+                'SELECT id, slug, title, "authorName", "coverColor", "coverUrl", rating, views, '
+                '"totalChapters", status, description, "bookmarkCount", "seriesId", "updatedAt" '
+                'FROM "Novel" '
+                'ORDER BY "updatedAt" DESC '
+                'LIMIT :take'
+            ),
+            {"take": take},
+        )
+    ).mappings().all()
+
+    return [_home_novel_from_row(dict(row)) for row in rows]
+
+
+async def _fetch_home_manual_recommendations(db: AsyncSession) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    editor_docs = await mongo_db["editorrecommendations"].find({}).sort("createdAt", -1).limit(2000).to_list(2000)
+    user_docs = await mongo_db["userrecommendations"].find({}).sort("createdAt", -1).limit(5000).to_list(5000)
+
+    novel_ids = list(
+        {
+            str(item.get("novelId"))
+            for item in [*editor_docs, *user_docs]
+            if item.get("novelId")
+        }
+    )
+    editor_ids = list({str(item.get("editorId")) for item in editor_docs if item.get("editorId")})
+
+    if not novel_ids:
+        return [], []
+
+    novel_rows = (
+        await db.execute(
+            text(
+                'SELECT id, slug, title, "authorName", "coverUrl", rating '
+                'FROM "Novel" '
+                'WHERE id = ANY(:novel_ids)'
+            ),
+            {"novel_ids": novel_ids},
+        )
+    ).mappings().all()
+    editor_rows = []
+    if editor_ids:
+        editor_rows = (
+            await db.execute(
+                text('SELECT id, name FROM "User" WHERE id = ANY(:editor_ids)'),
+                {"editor_ids": editor_ids},
+            )
+        ).mappings().all()
+
+    novel_map = {
+        row["id"]: {
+            "id": row["id"],
+            "slug": row["slug"],
+            "title": row["title"],
+            "authorName": row["authorName"],
+            "coverUrl": row.get("coverUrl"),
+            "rating": float(row.get("rating") or 0),
+        }
+        for row in novel_rows
+    }
+    editor_map = {row["id"]: row.get("name") or "Biên tập viên" for row in editor_rows}
+
+    recommend_count_map: dict[str, int] = {}
+    for doc in [*editor_docs, *user_docs]:
+        novel_id = str(doc.get("novelId") or "")
+        if not novel_id:
+            continue
+        recommend_count_map[novel_id] = recommend_count_map.get(novel_id, 0) + 1
+
+    top_items = [
+        {"novel": novel_map[novel_id], "recommendCount": count}
+        for novel_id, count in recommend_count_map.items()
+        if novel_id in novel_map
+    ]
+    top_items.sort(
+        key=lambda item: (
+            -item["recommendCount"],
+            -float(item["novel"].get("rating") or 0),
+        )
+    )
+
+    editor_items: list[dict[str, Any]] = []
+    for doc in editor_docs:
+        novel_id = str(doc.get("novelId") or "")
+        if novel_id not in novel_map:
+            continue
+        editor_items.append(
+            {
+                "novel": novel_map[novel_id],
+                "editorName": editor_map.get(str(doc.get("editorId") or ""), "Biên tập viên"),
+                "recommendCount": recommend_count_map.get(novel_id, 0),
+                "createdAt": _iso(doc.get("createdAt")),
+            }
+        )
+
+    editor_items.sort(
+        key=lambda item: (
+            -item["recommendCount"],
+            item["createdAt"] or "",
+        ),
+        reverse=False,
+    )
+    editor_items.reverse()
+
+    for item in editor_items:
+        item.pop("createdAt", None)
+
+    return top_items, editor_items
+
+
+async def _fetch_home_recent_comments(db: AsyncSession, *, take: int = 10) -> list[dict[str, Any]]:
+    rows = (
+        await db.execute(
+            text(
+                'SELECT c.id, c.content, c."createdAt", u.name AS username, n.slug AS novel_slug, n.title AS novel_title '
+                'FROM "Comment" c '
+                'JOIN "User" u ON u.id = c."userId" '
+                'JOIN "Novel" n ON n.id = c."novelId" '
+                'ORDER BY c."createdAt" DESC '
+                'LIMIT :take'
+            ),
+            {"take": take},
+        )
+    ).mappings().all()
+
+    return [
+        {
+            "id": row["id"],
+            "content": row["content"],
+            "createdAt": _iso(row["createdAt"]),
+            "user": {"name": row.get("username")},
+            "novel": {"slug": row["novel_slug"], "title": row["novel_title"]},
+        }
+        for row in rows
+    ]
+
+
+async def _fetch_home_latest_novels(db: AsyncSession, *, take: int = 5) -> list[dict[str, Any]]:
+    recent_chapters = await mongo_db["chapters"].find(
+        {},
+        {"novelId": 1, "number": 1, "title": 1, "createdAt": 1},
+    ).sort("_id", -1).limit(400).to_list(400)
+
+    latest_novel_ids: list[str] = []
+    latest_seen_ids: set[str] = set()
+    latest_chapter_map: dict[str, dict[str, Any]] = {}
+
+    for row in recent_chapters:
+        novel_id = str(row.get("novelId") or "").strip()
+        if not novel_id or novel_id in latest_seen_ids:
+            continue
+        latest_seen_ids.add(novel_id)
+        latest_novel_ids.append(novel_id)
+        latest_chapter_map[novel_id] = {
+            "number": row.get("number"),
+            "title": row.get("title"),
+            "createdAt": _iso(row.get("createdAt")),
+        }
+        if len(latest_novel_ids) >= 500:
+            break
+
+    if not latest_novel_ids:
+        return []
+
+    novel_rows = (
+        await db.execute(
+            text(
+                'SELECT id, slug, title, "authorName", "coverColor", "coverUrl", rating, views, '
+                '"totalChapters", status, description, "bookmarkCount", "seriesId", "updatedAt" '
+                'FROM "Novel" '
+                'WHERE id = ANY(:novel_ids)'
+            ),
+            {"novel_ids": latest_novel_ids},
+        )
+    ).mappings().all()
+
+    novel_map = {row["id"]: _home_novel_from_row(dict(row)) for row in novel_rows}
+    ordered = [novel_map[novel_id] for novel_id in latest_novel_ids if novel_id in novel_map]
+    collapsed = _collapse_series_rows(ordered)[:take]
+
+    for novel in collapsed:
+        novel["latestChapter"] = latest_chapter_map.get(novel["id"])
+
+    return collapsed
+
+
+def _to_hot_slide(row: dict[str, Any], source: str) -> dict[str, Any]:
+    novel = row["novel"]
+    return {
+        "id": novel["id"],
+        "slug": novel["slug"],
+        "title": novel["title"],
+        "authorName": novel["authorName"],
+        "description": novel["description"],
+        "coverUrl": novel["coverUrl"],
+        "totalChapters": novel["totalChapters"],
+        "rating": novel["rating"],
+        "views": row["aggregatedViews"],
+        "status": novel["status"],
+        "hotSource": source,
+    }
+
+
+@app.get("/api/home")
+async def get_home_data(db: AsyncSession = Depends(get_db_session)):
+    today = dt.datetime.now(dt.timezone.utc).date()
+    week_start = today - dt.timedelta(days=7)
+    month_start = today - dt.timedelta(days=30)
+
+    weekly_raw = await _fetch_home_ranking_rows(db, since=week_start, take=600)
+    monthly_raw = await _fetch_home_ranking_rows(db, since=month_start, take=600)
+    all_time_raw = await _fetch_home_ranking_rows(db, take=800)
+    popular_fallback = await _fetch_home_popular_fallback(db, take=400)
+    random_pool = await _fetch_home_random_pool(db, take=420)
+    top_recommendations, editor_recommendations = await _fetch_home_manual_recommendations(db)
+    recent_comments = await _fetch_home_recent_comments(db, take=10)
+    latest_novels = await _fetch_home_latest_novels(db, take=5)
+
+    weekly_ranking = _fill_unique_rows(_collapse_series_rows(weekly_raw), _collapse_series_rows(popular_fallback), 5)
+    monthly_ranking = _fill_unique_rows(_collapse_series_rows(monthly_raw), _collapse_series_rows(popular_fallback), 5)
+    all_time_ranking = _fill_unique_rows(_collapse_series_rows(all_time_raw), _collapse_series_rows(popular_fallback), 5)
+
+    hot_primary = [_to_hot_slide(item, "week") for item in weekly_ranking[:5]] + [_to_hot_slide(item, "month") for item in monthly_ranking[:5]]
+    hot_fallback = [_to_hot_slide(item, "all") for item in all_time_ranking[:8]]
+    hot_slides = _fill_unique_rows(hot_primary, hot_fallback, 10)
+
+    used_hot_ids = {item["id"] for item in hot_slides}
+    random_candidates = [item for item in _collapse_series_rows(_shuffle_rows(random_pool)) if item["id"] not in used_hot_ids]
+    random_novels = _fill_unique_rows(random_candidates, _shuffle_rows(random_pool), 12)
+
+    return {
+        "hotSlides": hot_slides,
+        "randomNovels": random_novels,
+        "recommendedByCountItems": top_recommendations,
+        "editorRecommendedItems": editor_recommendations,
+        "weeklyRanking": weekly_ranking,
+        "monthlyRanking": monthly_ranking,
+        "allTimeRanking": all_time_ranking,
+        "latestNovels": latest_novels,
+        "recentComments": recent_comments,
+    }
 
 
 async def _load_bookmark_with_novel(db: AsyncSession, user_id: str, novel_id: str) -> dict[str, Any] | None:
@@ -156,25 +546,6 @@ async def _update_reading_progress(
 
     bookmark = await _load_bookmark_with_novel(db, user_id, novel_id)
     return {"status": "updated", "bookmark": bookmark}
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    yield
-    mongo_client.close()
-
-
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
-
-app.include_router(mod.router)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 @app.get("/api/health")
@@ -460,7 +831,7 @@ async def get_novel_chapters(
     skip = (page - 1) * limit
     chapters_cursor = (
         mongo_db["chapters"]
-        .find({"novelId": novel_id}, {"title": 1, "number": 1, "createdAt": 1, "volumeNumber": 1, "volumeTitle": 1, "volumeChapterNumber": 1})
+        .find({"novelId": novel_id}, {"title": 1, "number": 1, "createdAt": 1, "views": 1, "volumeNumber": 1, "volumeTitle": 1, "volumeChapterNumber": 1})
         .sort("number", 1)
         .skip(skip)
         .limit(limit)
@@ -474,6 +845,7 @@ async def get_novel_chapters(
                 "id": str(item.get("_id")),
                 "number": item.get("number"),
                 "title": item.get("title"),
+                "views": item.get("views", 0),
                 "volumeNumber": item.get("volumeNumber"),
                 "volumeTitle": item.get("volumeTitle"),
                 "volumeChapterNumber": item.get("volumeChapterNumber"),
@@ -484,6 +856,41 @@ async def get_novel_chapters(
         "totalChapters": total_chapters,
         "totalPages": (total_chapters + limit - 1) // limit if total_chapters else 0,
         "currentPage": page,
+    }
+
+
+@app.get("/api/truyen/{novel_id}/chapters/by-number/{chapter_number}")
+async def get_chapter_by_number(novel_id: str, chapter_number: int):
+    chapter = await mongo_db["chapters"].find_one({"novelId": novel_id, "number": chapter_number})
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    prev_chapter = await mongo_db["chapters"].find_one(
+        {"novelId": novel_id, "number": chapter_number - 1},
+        {"number": 1},
+    )
+    next_chapter = await mongo_db["chapters"].find_one(
+        {"novelId": novel_id, "number": chapter_number + 1},
+        {"number": 1},
+    )
+    max_chapter = await mongo_db["chapters"].count_documents({"novelId": novel_id})
+
+    await mongo_db["chapters"].update_one({"_id": chapter["_id"]}, {"$inc": {"views": 1}})
+
+    return {
+        "id": str(chapter.get("_id")),
+        "novelId": chapter.get("novelId"),
+        "number": chapter.get("number"),
+        "title": chapter.get("title"),
+        "content": chapter.get("content"),
+        "views": int(chapter.get("views") or 0) + 1,
+        "volumeNumber": chapter.get("volumeNumber"),
+        "volumeTitle": chapter.get("volumeTitle"),
+        "volumeChapterNumber": chapter.get("volumeChapterNumber"),
+        "createdAt": _iso(chapter.get("createdAt")),
+        "prevChapterNumber": prev_chapter.get("number") if prev_chapter else None,
+        "nextChapterNumber": next_chapter.get("number") if next_chapter else None,
+        "maxChapter": max_chapter,
     }
 
 
@@ -592,6 +999,7 @@ async def rate_novel(novel_id: str, payload: RatePayload, db: AsyncSession = Dep
 async def list_comments(
     novel_id: str,
     chapterId: str | None = None,
+    scope: str | None = None,
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=20, ge=1, le=50),
     db: AsyncSession = Depends(get_db_session),
@@ -600,6 +1008,9 @@ async def list_comments(
     if chapterId:
         where_sql = 'c."novelId" = :novel_id AND c."chapterId" = :chapter_id'
         params = {"novel_id": novel_id, "chapter_id": chapterId, "skip": skip, "limit": limit}
+    elif scope == "chapter":
+        where_sql = 'c."novelId" = :novel_id AND c."chapterId" IS NOT NULL'
+        params = {"novel_id": novel_id, "skip": skip, "limit": limit}
     else:
         where_sql = 'c."novelId" = :novel_id AND c."chapterId" IS NULL'
         params = {"novel_id": novel_id, "skip": skip, "limit": limit}

@@ -64,17 +64,31 @@ curl http://localhost:8000/api/health
 
 ## Docker Compose
 
-### Production-style API only (external DBs)
+Current `docker-compose.yml` supports a unified deployment for both web + API.
+
+### Web + API (use external DBs)
 
 ```bash
-docker compose up -d --build api
+docker compose up -d --build api web
 ```
 
-### Full local stack (API + Postgres + Mongo)
+Required env for web OAuth in `.env`:
+
+```env
+WEB_GOOGLE_CLIENT_ID=web-client-id.apps.googleusercontent.com
+WEB_GOOGLE_CLIENT_SECRET=replace-with-web-google-client-secret
+```
+
+### Full local stack (API local + Postgres + Mongo)
 
 ```bash
-docker compose --profile localdb up -d --build
+docker compose --profile localdb up -d --build api-local postgres mongo
 ```
+
+Notes:
+- `api` listens on port `8000` and is intended for external DB deployments.
+- `api-local` listens on port `8001` and automatically points to `postgres` + `mongo` containers.
+- `web` listens on port `3000` and calls API internally through `http://api:8000`.
 
 ## Implemented Endpoints
 

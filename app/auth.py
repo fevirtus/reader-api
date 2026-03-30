@@ -70,7 +70,34 @@ async def _get_user_from_session_cookie(db: AsyncSession, request: Request) -> d
         {"token": token},
     )
     row = result.mappings().first()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+
+    # Support NextAuth/Auth.js JWT session cookies when frontend runs in JWT mode.
+    secret = _jwt_secret()
+    if not secret:
+        return None
+
+    try:
+        payload = jwt.decode(token, secret, algorithms=["HS256"])
+    except JWTError:
+        return None
+
+    subject = payload.get("sub") or payload.get("id")
+    if not isinstance(subject, str) or not subject:
+        return None
+
+    role = payload.get("role")
+    if isinstance(role, str) and role:
+        return {
+            "id": subject,
+            "email": payload.get("email"),
+            "name": payload.get("name"),
+            "image": payload.get("picture") or payload.get("image"),
+            "role": role,
+        }
+
+    return await _get_user_by_id(db, subject)
 
 
 async def resolve_current_user(db: AsyncSession, request: Request) -> dict[str, Any] | None:

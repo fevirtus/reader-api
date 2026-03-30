@@ -150,7 +150,10 @@ async def dev_make_mod(
 
 
 @router.get("/mod/the-loai")
-async def mod_list_genres(db: AsyncSession = Depends(get_db_session)):
+async def mod_list_genres(
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_mod_user),
+):
     result = await db.execute(text('SELECT id, name, slug, description, icon FROM "Genre" ORDER BY name ASC'))
     return [dict(r) for r in result.mappings()]
 
@@ -374,6 +377,64 @@ async def _resolve_series_id(
 # ---------------------------------------------------------------------------
 # /api/mod/truyen
 # ---------------------------------------------------------------------------
+
+
+@router.get("/mod/overview")
+async def mod_overview(
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_mod_user),
+):
+    if _is_admin(user):
+        novel_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Novel"'))).scalar() or 0
+        total_views = (await db.execute(text('SELECT COALESCE(SUM(views), 0)::bigint FROM "Novel"'))).scalar() or 0
+        comment_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Comment"'))).scalar() or 0
+        series_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Series"'))).scalar() or 0
+    else:
+        novel_count = (
+            await db.execute(
+                text('SELECT COUNT(*)::int FROM "Novel" WHERE "uploaderId" = :uid OR "uploaderId" IS NULL'),
+                {"uid": user["id"]},
+            )
+        ).scalar() or 0
+        total_views = (
+            await db.execute(
+                text('SELECT COALESCE(SUM(views), 0)::bigint FROM "Novel" WHERE "uploaderId" = :uid OR "uploaderId" IS NULL'),
+                {"uid": user["id"]},
+            )
+        ).scalar() or 0
+        comment_count = (
+            await db.execute(
+                text(
+                    'SELECT COUNT(c.id)::int '
+                    'FROM "Comment" c '
+                    'JOIN "Novel" n ON n.id = c."novelId" '
+                    'WHERE n."uploaderId" = :uid OR n."uploaderId" IS NULL'
+                ),
+                {"uid": user["id"]},
+            )
+        ).scalar() or 0
+        series_count = (
+            await db.execute(
+                text(
+                    'SELECT COUNT(s.id)::int '
+                    'FROM "Series" s '
+                    'WHERE EXISTS ('
+                    '  SELECT 1 FROM "Novel" n '
+                    '  WHERE n."seriesId" = s.id AND (n."uploaderId" = :uid OR n."uploaderId" IS NULL)'
+                    ') OR NOT EXISTS ('
+                    '  SELECT 1 FROM "Novel" n2 WHERE n2."seriesId" = s.id'
+                    ')'
+                ),
+                {"uid": user["id"]},
+            )
+        ).scalar() or 0
+
+    return {
+        "novelCount": int(novel_count),
+        "totalViews": int(total_views),
+        "commentCount": int(comment_count),
+        "seriesCount": int(series_count),
+    }
 
 
 @router.get("/mod/truyen")
