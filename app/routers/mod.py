@@ -1,6 +1,7 @@
 """MOD panel API routes — all require MOD or ADMIN role."""
 from __future__ import annotations
 
+import datetime as dt
 import io
 import mimetypes
 import os
@@ -33,6 +34,18 @@ router = APIRouter(prefix="/api", tags=["mod"])
 # ---------------------------------------------------------------------------
 
 MAX_RECOMMENDATIONS_PER_EDITOR = 5
+
+
+def _to_iso(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=dt.timezone.utc)
+        return value.isoformat()
+    if isinstance(value, dt.date):
+        return dt.datetime.combine(value, dt.time(0, 0, tzinfo=dt.timezone.utc)).isoformat()
+    return str(value)
 
 
 def _new_cuid() -> str:
@@ -675,45 +688,6 @@ async def mod_delete_novel(
     return {"success": True}
 
 
-@router.get("/mod/truyen/{novel_id}")
-async def mod_get_novel(
-    novel_id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_mod_user),
-):
-    if _is_admin(user):
-        result = await db.execute(
-            text('SELECT * FROM "Novel" WHERE id = :id'), {"id": novel_id}
-        )
-    else:
-        result = await db.execute(
-            text('SELECT * FROM "Novel" WHERE id = :id AND ("uploaderId" = :uid OR "uploaderId" IS NULL)'),
-            {"id": novel_id, "uid": user["id"]},
-        )
-    row = result.mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Không tìm thấy truyện")
-
-    novel = dict(row)
-
-    # Genres
-    genres_result = await db.execute(
-        text('SELECT g.id, g.name, g.slug FROM "NovelGenre" ng JOIN "Genre" g ON g.id = ng."genreId" WHERE ng."novelId" = :nid'),
-        {"nid": novel_id},
-    )
-    novel["genres"] = [dict(r) for r in genres_result.mappings()]
-
-    # Series
-    if novel.get("seriesId"):
-        s_result = await db.execute(
-            text('SELECT id, name, slug, description FROM "Series" WHERE id = :id LIMIT 1'),
-            {"id": novel["seriesId"]},
-        )
-        novel["series"] = dict(s_result.mappings().first() or {})
-
-    return novel
-
-
 @router.get("/mod/truyen/{novel_id}/trash-words")
 async def mod_get_trash_words(
     novel_id: str,
@@ -778,12 +752,12 @@ async def mod_bulk_novels(
 
     if _is_admin(user):
         result = await db.execute(
-            text('SELECT id, "coverUrl" FROM "Novel" WHERE id = ANY(:ids::text[])'),
+            text('SELECT id, "coverUrl" FROM "Novel" WHERE id = ANY(:ids)'),
             {"ids": body.ids},
         )
     else:
         result = await db.execute(
-            text('SELECT id, "coverUrl" FROM "Novel" WHERE id = ANY(:ids::text[]) AND ("uploaderId" = :uid OR "uploaderId" IS NULL)'),
+            text('SELECT id, "coverUrl" FROM "Novel" WHERE id = ANY(:ids) AND ("uploaderId" = :uid OR "uploaderId" IS NULL)'),
             {"ids": body.ids, "uid": user["id"]},
         )
     accessible = result.mappings().all()
@@ -793,7 +767,7 @@ async def mod_bulk_novels(
 
     await mongo_db.chapters.delete_many({"novelId": {"$in": accessible_ids}})
     await db.execute(
-        text('DELETE FROM "Novel" WHERE id = ANY(:ids::text[])'), {"ids": accessible_ids}
+            text('DELETE FROM "Novel" WHERE id = ANY(:ids)'), {"ids": accessible_ids}
     )
     await db.commit()
 
@@ -845,7 +819,7 @@ async def mod_novels_missing(
         ),
         params,
     )
-    return [dict(r) for r in result.mappings()]
+    return {"items": [dict(r) for r in result.mappings()]}
 
 
 class MissingPatchItem(BaseModel):
@@ -872,11 +846,11 @@ async def mod_patch_missing(
     ids = [u.id for u in body.updates]
     if _is_admin(user):
         access_result = await db.execute(
-            text('SELECT id FROM "Novel" WHERE id = ANY(:ids::text[])'), {"ids": ids}
+            text('SELECT id FROM "Novel" WHERE id = ANY(:ids)'), {"ids": ids}
         )
     else:
         access_result = await db.execute(
-            text('SELECT id FROM "Novel" WHERE id = ANY(:ids::text[]) AND ("uploaderId" = :uid OR "uploaderId" IS NULL)'),
+            text('SELECT id FROM "Novel" WHERE id = ANY(:ids) AND ("uploaderId" = :uid OR "uploaderId" IS NULL)'),
             {"ids": ids, "uid": user["id"]},
         )
     accessible_ids = {r["id"] for r in access_result.mappings()}
@@ -909,6 +883,43 @@ async def mod_patch_missing(
 
     await db.commit()
     return {"updatedCount": updated}
+
+
+@router.get("/mod/truyen/{novel_id}")
+async def mod_get_novel(
+    novel_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_mod_user),
+):
+    if _is_admin(user):
+        result = await db.execute(
+            text('SELECT * FROM "Novel" WHERE id = :id'), {"id": novel_id}
+        )
+    else:
+        result = await db.execute(
+            text('SELECT * FROM "Novel" WHERE id = :id AND ("uploaderId" = :uid OR "uploaderId" IS NULL)'),
+            {"id": novel_id, "uid": user["id"]},
+        )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Không tìm thấy truyện")
+
+    novel = dict(row)
+
+    genres_result = await db.execute(
+        text('SELECT g.id, g.name, g.slug FROM "NovelGenre" ng JOIN "Genre" g ON g.id = ng."genreId" WHERE ng."novelId" = :nid'),
+        {"nid": novel_id},
+    )
+    novel["genres"] = [dict(r) for r in genres_result.mappings()]
+
+    if novel.get("seriesId"):
+        s_result = await db.execute(
+            text('SELECT id, name, slug, description FROM "Series" WHERE id = :id LIMIT 1'),
+            {"id": novel["seriesId"]},
+        )
+        novel["series"] = dict(s_result.mappings().first() or {})
+
+    return novel
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1328,10 @@ async def mod_list_recommendations(
     novels_map: dict[str, dict] = {}
     if novel_ids:
         n_result = await db.execute(
-            text('SELECT id, title, slug, "coverUrl", "authorName", status FROM "Novel" WHERE id = ANY(:ids::text[])'),
+            text(
+                'SELECT id, title, slug, "coverUrl", "authorName", status, "totalChapters" '
+                'FROM "Novel" WHERE id = ANY(:ids)'
+            ),
             {"ids": novel_ids},
         )
         for r in n_result.mappings():
@@ -1326,31 +1340,100 @@ async def mod_list_recommendations(
     editors_map: dict[str, dict] = {}
     if editor_ids:
         e_result = await db.execute(
-            text('SELECT id, name, email FROM "User" WHERE id = ANY(:ids::text[])'),
+            text('SELECT id, name, email FROM "User" WHERE id = ANY(:ids)'),
             {"ids": editor_ids},
         )
         for r in e_result.mappings():
             editors_map[r["id"]] = dict(r)
 
+    recommend_count_map: dict[str, int] = {}
+    for r in recs:
+        novel_id = str(r.get("novelId") or "")
+        if novel_id:
+            recommend_count_map[novel_id] = recommend_count_map.get(novel_id, 0) + 1
+
     items = []
     for r in recs:
-        items.append({
-            "id": str(r["_id"]),
-            "novelId": str(r.get("novelId", "")),
-            "editorId": str(r.get("editorId", "")),
-            "novel": novels_map.get(str(r.get("novelId", "")), None),
-            "editor": editors_map.get(str(r.get("editorId", "")), None),
-            "createdAt": str(r.get("createdAt", "")),
-        })
+        novel_id = str(r.get("novelId", ""))
+        editor_id = str(r.get("editorId", ""))
+        novel = novels_map.get(novel_id)
+        editor = editors_map.get(editor_id)
+        if not novel or not editor:
+            continue
+
+        items.append(
+            {
+                "id": str(r["_id"]),
+                "createdAt": _to_iso(r.get("createdAt")),
+                "recommendCount": recommend_count_map.get(novel_id, 0),
+                "novel": {
+                    "id": novel["id"],
+                    "title": novel["title"],
+                    "slug": novel["slug"],
+                    "authorName": novel.get("authorName") or "",
+                    "coverUrl": novel.get("coverUrl"),
+                    "status": novel.get("status") or "Đang ra",
+                    "totalChapters": int(novel.get("totalChapters") or 0),
+                },
+                "editor": {
+                    "id": editor["id"],
+                    "name": editor.get("name") or "Biên tập viên",
+                },
+            }
+        )
+
+    summary = []
+    for novel_id, recommend_count in recommend_count_map.items():
+        novel = novels_map.get(novel_id)
+        if not novel:
+            continue
+        summary.append(
+            {
+                "novel": {
+                    "id": novel["id"],
+                    "title": novel["title"],
+                    "slug": novel["slug"],
+                    "authorName": novel.get("authorName") or "",
+                    "coverUrl": novel.get("coverUrl"),
+                    "status": novel.get("status") or "Đang ra",
+                    "totalChapters": int(novel.get("totalChapters") or 0),
+                },
+                "recommendCount": recommend_count,
+            }
+        )
+    summary.sort(key=lambda item: item["recommendCount"], reverse=True)
 
     # Search candidates
     candidates = []
     if q.strip():
         c_result = await db.execute(
-            text('SELECT id, title, slug FROM "Novel" WHERE title ILIKE :q LIMIT 20'),
+            text(
+                'SELECT id, title, slug, "authorName", "coverUrl", status, "totalChapters" '
+                'FROM "Novel" WHERE title ILIKE :q OR "authorName" ILIKE :q OR slug ILIKE :q LIMIT 20'
+            ),
             {"q": f"%{q}%"},
         )
-        candidates = [dict(r) for r in c_result.mappings()]
+        candidates = []
+        for r in c_result.mappings():
+            row = dict(r)
+            novel_id = row["id"]
+            already_recommended = any(
+                str(item.get("novelId")) == novel_id and str(item.get("editorId")) == user["id"]
+                for item in recs
+            )
+            candidates.append(
+                {
+                    "id": row["id"],
+                    "title": row["title"],
+                    "slug": row["slug"],
+                    "authorName": row.get("authorName") or "",
+                    "coverUrl": row.get("coverUrl"),
+                    "status": row.get("status") or "Đang ra",
+                    "totalChapters": int(row.get("totalChapters") or 0),
+                    "alreadyRecommended": already_recommended,
+                    "recommendCount": int(recommend_count_map.get(novel_id, 0)),
+                }
+            )
 
     my_novel_result = await db.execute(
         text('SELECT id FROM "Novel" WHERE "uploaderId" = :uid OR "uploaderId" IS NULL'),
@@ -1358,11 +1441,19 @@ async def mod_list_recommendations(
     )
     my_novel_ids = [r["id"] for r in my_novel_result.mappings()]
 
+    current_user_rec_count = sum(1 for item in recs if str(item.get("editorId")) == user["id"])
+
     return {
         "items": items,
+        "summary": summary,
         "candidates": candidates,
         "myNovelIds": my_novel_ids,
-        "currentUser": {"id": user["id"], "role": user.get("role")},
+        "currentUser": {
+            "id": user["id"],
+            "role": user.get("role"),
+            "recommendationCount": current_user_rec_count,
+            "maxRecommendationCount": MAX_RECOMMENDATIONS_PER_EDITOR,
+        },
     }
 
 
@@ -2423,7 +2514,7 @@ async def mod_ai_enrich_batch(
     result = await db.execute(
         text(
             'SELECT id, title, "originalTitle", "authorName", "originalAuthorName", description '
-            'FROM "Novel" WHERE id = ANY(:ids::text[])'
+            'FROM "Novel" WHERE id = ANY(:ids)'
         ),
         {"ids": body.novelIds},
     )
