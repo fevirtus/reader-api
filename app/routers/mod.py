@@ -214,6 +214,72 @@ async def mod_delete_genre(
     return {"success": True}
 
 
+class GenreUpdateBody(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    icon: str | None = None
+
+
+@router.put("/mod/the-loai")
+async def mod_update_genre(
+    body: GenreUpdateBody,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_mod_user),
+):
+    slug = slugify(body.name)
+    try:
+        result = await db.execute(
+            text(
+                'UPDATE "Genre" SET name = :name, slug = :slug, description = :desc, icon = :icon '
+                'WHERE id = :id RETURNING id, name, slug, description, icon'
+            ),
+            {"id": body.id, "name": body.name, "slug": slug, "desc": body.description, "icon": body.icon},
+        )
+        await db.commit()
+        row = result.mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thể loại")
+        return dict(row)
+    except Exception as e:
+        await db.rollback()
+        if "unique" in str(e).lower() or "23505" in str(e):
+            raise HTTPException(status_code=400, detail="Tên thể loại đã tồn tại")
+        raise
+
+
+class GenreMergeBody(BaseModel):
+    sourceId: str   # thể loại sẽ bị xóa
+    targetId: str   # thể loại giữ lại
+
+
+@router.post("/mod/the-loai/merge")
+async def mod_merge_genre(
+    body: GenreMergeBody,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_mod_user),
+):
+    if body.sourceId == body.targetId:
+        raise HTTPException(status_code=400, detail="sourceId và targetId phải khác nhau")
+
+    # Re-point NovelGenre rows: ON CONFLICT DO NOTHING để tránh duplicate
+    await db.execute(
+        text(
+            'INSERT INTO "NovelGenre" ("novelId", "genreId") '
+            'SELECT "novelId", :target FROM "NovelGenre" WHERE "genreId" = :source '
+            'ON CONFLICT DO NOTHING'
+        ),
+        {"source": body.sourceId, "target": body.targetId},
+    )
+    await db.execute(
+        text('DELETE FROM "NovelGenre" WHERE "genreId" = :source'),
+        {"source": body.sourceId},
+    )
+    await db.execute(text('DELETE FROM "Genre" WHERE id = :id'), {"id": body.sourceId})
+    await db.commit()
+    return {"success": True}
+
+
 # ---------------------------------------------------------------------------
 # /api/mod/series
 # ---------------------------------------------------------------------------
@@ -2229,7 +2295,7 @@ async def mod_upload_epub(
             ),
             {
                 "id": novel_id, "title": meta_title, "slug": slug,
-                "author": meta_author, "desc": meta_description,
+                "author": meta_author, "desc": meta_description or "",
                 "cover": cover_url, "uid": user["id"], "sid": series_id,
             },
         )

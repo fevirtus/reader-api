@@ -574,6 +574,31 @@ async def healthcheck(db: AsyncSession = Depends(get_db_session)):
     }
 
 
+_VN_ORDER: dict[str, tuple[int, int]] = {
+    **{c: (1, i) for i, c in enumerate("aàảãáạ")},
+    **{c: (2, i) for i, c in enumerate("ăằẳẵắặ")},
+    **{c: (3, i) for i, c in enumerate("âầẩẫấậ")},
+    "b": (4, 0), "c": (5, 0), "d": (6, 0), "đ": (7, 0),
+    **{c: (8, i) for i, c in enumerate("eèẻẽéẹ")},
+    **{c: (9, i) for i, c in enumerate("êềểễếệ")},
+    "g": (10, 0), "h": (11, 0),
+    **{c: (12, i) for i, c in enumerate("iìỉĩíị")},
+    "k": (13, 0), "l": (14, 0), "m": (15, 0), "n": (16, 0),
+    **{c: (17, i) for i, c in enumerate("oòỏõóọ")},
+    **{c: (18, i) for i, c in enumerate("ôồổỗốộ")},
+    **{c: (19, i) for i, c in enumerate("ơờởỡớợ")},
+    "p": (20, 0), "q": (21, 0), "r": (22, 0), "s": (23, 0), "t": (24, 0),
+    **{c: (25, i) for i, c in enumerate("uùủũúụ")},
+    **{c: (26, i) for i, c in enumerate("ưừửữứự")},
+    "v": (27, 0), "x": (28, 0),
+    **{c: (29, i) for i, c in enumerate("yỳỷỹýỵ")},
+}
+
+
+def _vn_sort_key(s: str) -> list[tuple[int, int]]:
+    return [_VN_ORDER.get(c, (ord(c), 0)) for c in s.lower()]
+
+
 @app.get("/api/genres")
 async def list_genres(db: AsyncSession = Depends(get_db_session)):
     result = await db.execute(
@@ -581,11 +606,24 @@ async def list_genres(db: AsyncSession = Depends(get_db_session)):
             'SELECT g.id, g.name, g.slug, g.description, g.icon, COUNT(ng."novelId")::int AS "novelCount" '
             'FROM "Genre" g '
             'LEFT JOIN "NovelGenre" ng ON ng."genreId" = g.id '
-            'GROUP BY g.id '
-            'ORDER BY g.name ASC'
+            'GROUP BY g.id'
         )
     )
-    return [dict(row) for row in result.mappings().all()]
+    rows = [dict(row) for row in result.mappings().all()]
+    rows.sort(key=lambda r: _vn_sort_key(r["name"]))
+    return rows
+
+
+@app.get("/api/genres/{slug}")
+async def get_genre_by_slug(slug: str, db: AsyncSession = Depends(get_db_session)):
+    result = await db.execute(
+        text('SELECT id, name, slug, description, icon FROM "Genre" WHERE slug = :slug LIMIT 1'),
+        {"slug": slug},
+    )
+    row = result.mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Genre not found")
+    return dict(row)
 
 
 @app.get("/api/novels/browse")
@@ -595,11 +633,18 @@ async def browse_novels(
     status: str = "",
     sort: str = "latest",
     page: int = Query(default=1, ge=1),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=20, ge=1, le=500),
+    collapse_series: bool = Query(default=False),
     db: AsyncSession = Depends(get_db_session),
 ):
     skip = (page - 1) * limit
-    order_clause = {
+    outer_order_clause = {
+        "popular": 'views DESC',
+        "rating": 'rating DESC',
+        "name": 'title ASC',
+        "latest": '"updatedAt" DESC',
+    }.get(sort, '"updatedAt" DESC')
+    inner_order_clause = {
         "popular": 'n.views DESC',
         "rating": 'n.rating DESC',
         "name": 'n.title ASC',
@@ -629,32 +674,59 @@ async def browse_novels(
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
-    total_count = (
-        await db.execute(
-            text(
-                f'SELECT COUNT(*)::int FROM "Novel" n '
-                f'LEFT JOIN "Series" s ON s.id = n."seriesId" '
-                f'{where_sql}'
-            ),
-            params,
-        )
-    ).scalar_one()
+    base_select = (
+        'n.id, n.title, n.slug, n."originalTitle", n."authorName", n."coverUrl", n."coverColor", '
+        'n.status, n."totalChapters", n.views, n.rating, n."ratingCount", n."bookmarkCount", '
+        'n."seriesId", s.id AS series_id, s.name AS series_name, s.slug AS series_slug, n."updatedAt"'
+    )
+    base_from = (
+        'FROM "Novel" n '
+        'LEFT JOIN "Series" s ON s.id = n."seriesId" '
+    )
 
-    rows = (
-        await db.execute(
-            text(
-                f'SELECT n.id, n.title, n.slug, n."originalTitle", n."authorName", n."coverUrl", n."coverColor", '
-                f'n.status, n."totalChapters", n.views, n.rating, n."ratingCount", n."bookmarkCount", '
-                f'n."seriesId", s.id AS series_id, s.name AS series_name, s.slug AS series_slug, n."updatedAt" '
-                f'FROM "Novel" n '
-                f'LEFT JOIN "Series" s ON s.id = n."seriesId" '
-                f'{where_sql} '
-                f'ORDER BY {order_clause} '
-                f'OFFSET :skip LIMIT :limit'
-            ),
-            params,
+    if collapse_series:
+        # DISTINCT ON picks the best novel per series (most recent), then outer query sorts+paginates
+        inner_sql = (
+            f'SELECT DISTINCT ON (COALESCE(n."seriesId", n.id)) {base_select} '
+            f'{base_from}'
+            f'{where_sql} '
+            f'ORDER BY COALESCE(n."seriesId", n.id), n."updatedAt" DESC'
         )
-    ).mappings().all()
+        total_count = (
+            await db.execute(
+                text(f'SELECT COUNT(*)::int FROM ({inner_sql}) AS _c'),
+                params,
+            )
+        ).scalar_one()
+        rows = (
+            await db.execute(
+                text(
+                    f'SELECT * FROM ({inner_sql}) AS collapsed '
+                    f'ORDER BY {outer_order_clause} '
+                    f'OFFSET :skip LIMIT :limit'
+                ),
+                params,
+            )
+        ).mappings().all()
+    else:
+        total_count = (
+            await db.execute(
+                text(f'SELECT COUNT(*)::int {base_from}{where_sql}'),
+                params,
+            )
+        ).scalar_one()
+        rows = (
+            await db.execute(
+                text(
+                    f'SELECT {base_select} '
+                    f'{base_from}'
+                    f'{where_sql} '
+                    f'ORDER BY {inner_order_clause} '
+                    f'OFFSET :skip LIMIT :limit'
+                ),
+                params,
+            )
+        ).mappings().all()
 
     novel_ids = [row["id"] for row in rows]
     genre_map: dict[str, list[dict[str, str]]] = {novel_id: [] for novel_id in novel_ids}
@@ -677,29 +749,6 @@ async def browse_novels(
             )
 
     chapter_map: dict[str, dict[str, Any]] = {}
-    if novel_ids:
-        latest_chapters = await mongo_db["chapters"].aggregate(
-            [
-                {"$match": {"novelId": {"$in": novel_ids}}},
-                {"$sort": {"novelId": 1, "number": -1}},
-                {
-                    "$group": {
-                        "_id": "$novelId",
-                        "latestChapterNumber": {"$first": "$number"},
-                        "latestChapterTitle": {"$first": "$title"},
-                        "latestChapterAt": {"$first": "$createdAt"},
-                    }
-                },
-            ]
-        ).to_list(length=None)
-        chapter_map = {
-            item["_id"]: {
-                "number": item.get("latestChapterNumber"),
-                "title": item.get("latestChapterTitle"),
-                "createdAt": _iso(item.get("latestChapterAt")),
-            }
-            for item in latest_chapters
-        }
 
     items: list[dict[str, Any]] = []
     for row in rows:
