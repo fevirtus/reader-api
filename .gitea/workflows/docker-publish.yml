@@ -19,18 +19,23 @@ jobs:
 
       - name: Log in to Gitea Registry
         env:
-          REGISTRY: ${{ secrets.GITEA_REGISTRY }}
+          SERVER_URL: ${{ gitea.server_url }}
           USERNAME: ${{ gitea.actor }}
           PASSWORD: ${{ secrets.TOKEN }}
         run: |
+          REGISTRY="${SERVER_URL#https://}"
+          REGISTRY="${REGISTRY#http://}"
           echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
 
       - name: Build and push image
         env:
-          REGISTRY: ${{ secrets.GITEA_REGISTRY }}
+          SERVER_URL: ${{ gitea.server_url }}
           REPOSITORY: ${{ gitea.repository }}
           REF: ${{ gitea.ref }}
         run: |
+          REGISTRY="${SERVER_URL#https://}"
+          REGISTRY="${REGISTRY#http://}"
+
           if [[ "$REF" == refs/tags/v* ]]; then
             TAG="${REF#refs/tags/}"
           else
