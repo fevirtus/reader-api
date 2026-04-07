@@ -20,7 +20,7 @@ jobs:
       - name: Log in to Gitea Registry
         env:
           REGISTRY: ${{ secrets.GITEA_REGISTRY }}
-          USERNAME: ${{ secrets.GITEA_REGISTRY_USERNAME }}
+          USERNAME: ${{ gitea.actor }}
           PASSWORD: ${{ secrets.TOKEN }}
         run: |
           echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
@@ -28,20 +28,21 @@ jobs:
       - name: Build and push image
         env:
           REGISTRY: ${{ secrets.GITEA_REGISTRY }}
-          NAMESPACE: ${{ secrets.GITEA_REGISTRY_NAMESPACE }}
-          IMAGE_NAME: reader-api
+          REPOSITORY: ${{ gitea.repository }}
+          REF: ${{ gitea.ref }}
         run: |
-          TAG="$(git tag --points-at HEAD | grep '^v' | head -n 1 || true)"
-          if [[ -z "$TAG" ]]; then
+          if [[ "$REF" == refs/tags/v* ]]; then
+            TAG="${REF#refs/tags/}"
+          else
             TAG="latest"
           fi
 
-          IMAGE="$REGISTRY/$NAMESPACE/$IMAGE_NAME:$TAG"
+          IMAGE="$REGISTRY/$REPOSITORY:$TAG"
           docker build --network host -f Dockerfile -t "$IMAGE" .
           docker push "$IMAGE"
 
           if [[ "$TAG" != "latest" ]]; then
-            LATEST_IMAGE="$REGISTRY/$NAMESPACE/$IMAGE_NAME:latest"
+            LATEST_IMAGE="$REGISTRY/$REPOSITORY:latest"
             docker tag "$IMAGE" "$LATEST_IMAGE"
             docker push "$LATEST_IMAGE"
           fi
