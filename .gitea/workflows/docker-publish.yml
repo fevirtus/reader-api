@@ -1,0 +1,47 @@
+name: Build and Push Reader API Image
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - v*
+  workflow_dispatch:
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Log in to Gitea Registry
+        env:
+          REGISTRY: ${{ secrets.GITEA_REGISTRY }}
+          USERNAME: ${{ secrets.GITEA_REGISTRY_USERNAME }}
+          PASSWORD: ${{ secrets.TOKEN }}
+        run: |
+          echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
+
+      - name: Build and push image
+        env:
+          REGISTRY: ${{ secrets.GITEA_REGISTRY }}
+          NAMESPACE: ${{ secrets.GITEA_REGISTRY_NAMESPACE }}
+          IMAGE_NAME: reader-api
+        run: |
+          TAG="$(git tag --points-at HEAD | grep '^v' | head -n 1 || true)"
+          if [[ -z "$TAG" ]]; then
+            TAG="latest"
+          fi
+
+          IMAGE="$REGISTRY/$NAMESPACE/$IMAGE_NAME:$TAG"
+          docker build --network host -f Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+
+          if [[ "$TAG" != "latest" ]]; then
+            LATEST_IMAGE="$REGISTRY/$NAMESPACE/$IMAGE_NAME:latest"
+            docker tag "$IMAGE" "$LATEST_IMAGE"
+            docker push "$LATEST_IMAGE"
+          fi
