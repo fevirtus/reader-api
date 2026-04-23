@@ -17,7 +17,10 @@ SESSION_COOKIE_KEYS = [
     "__Secure-next-auth.session-token",
     "authjs.session-token",
     "__Secure-authjs.session-token",
+    "reader_access_token",
 ]
+
+ACCESS_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def _jwt_secret() -> str:
@@ -29,7 +32,7 @@ def create_access_token(user_id: str) -> str:
     payload = {
         "sub": user_id,
         "iat": int(now.timestamp()),
-        "exp": int((now + dt.timedelta(days=7)).timestamp()),
+        "exp": int((now + dt.timedelta(seconds=ACCESS_TOKEN_TTL_SECONDS)).timestamp()),
     }
     secret = _jwt_secret()
     if not secret:

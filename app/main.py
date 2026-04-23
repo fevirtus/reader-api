@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import create_access_token, require_current_user
+from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user
 from app.routers import mod
 from app.config import settings
 from app.database import get_db_session, mongo_client, mongo_db
@@ -1651,7 +1651,7 @@ async def mobile_login(payload: MobileLoginPayload, db: AsyncSession = Depends(g
     return {
         "accessToken": access_token,
         "refreshToken": refresh_token,
-        "expiresIn": 3600,
+        "expiresIn": ACCESS_TOKEN_TTL_SECONDS,
         "user": {
             "id": user["id"],
             "email": user.get("email"),
@@ -1659,4 +1659,18 @@ async def mobile_login(payload: MobileLoginPayload, db: AsyncSession = Depends(g
             "image": user.get("image"),
             "role": user.get("role", "USER"),
         },
+    }
+
+
+@app.get("/api/auth/session")
+async def auth_session(request: Request, db: AsyncSession = Depends(get_db_session)):
+    user = await require_current_user(db, request)
+    return {
+        "user": {
+            "id": user["id"],
+            "email": user.get("email"),
+            "name": user.get("name"),
+            "image": user.get("image"),
+            "role": user.get("role", "USER"),
+        }
     }
