@@ -4,9 +4,12 @@ import argparse
 import asyncio
 import hashlib
 import json
+import sys
 from pathlib import Path
 from bson import ObjectId
 from sqlalchemy import text
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import settings
 from app.database import SessionLocal, mongo_db
