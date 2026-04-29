@@ -9,6 +9,12 @@ services:
       - .env
     ports:
       - "8000:8000"
+    environment:
+      NAS_CONTENT_ROOT: ${NAS_CONTENT_ROOT:-/data/content}
+      EPUB_SOURCE_ROOT: ${EPUB_SOURCE_ROOT:-/data/epub-source}
+    volumes:
+      - nas_chapter_content:/data/content
+      - nas_epub_source:/data/epub-source
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health').read()"]
@@ -30,8 +36,13 @@ services:
     environment:
       DATABASE_URL: postgresql://reader:reader@postgres:5432/reader
       MONGODB_URI: mongodb://mongo:27017/reader
+      NAS_CONTENT_ROOT: ${NAS_CONTENT_ROOT:-/data/content}
+      EPUB_SOURCE_ROOT: ${EPUB_SOURCE_ROOT:-/data/epub-source}
     ports:
       - "8001:8000"
+    volumes:
+      - nas_chapter_content:/data/content
+      - nas_epub_source:/data/epub-source
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health').read()"]
@@ -104,3 +115,5 @@ volumes:
   web_uploads:
   postgres_data:
   mongo_data:
+  nas_chapter_content:
+  nas_epub_source:

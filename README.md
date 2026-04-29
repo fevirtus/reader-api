@@ -90,6 +90,51 @@ Notes:
 - `api-local` listens on port `8001` and automatically points to `postgres` + `mongo` containers.
 - `web` listens on port `3000` and calls API internally through `http://api:8000`.
 
+### NAS mount points (chapter content + EPUB source)
+
+API containers now reserve two mount folders:
+
+- `/data/content`: converted chapter files (`txt` + `raw_html`)
+- `/data/epub-source`: source EPUB library
+
+Default env mapping (already wired in compose):
+
+```env
+NAS_CONTENT_ROOT=/data/content
+EPUB_SOURCE_ROOT=/data/epub-source
+```
+
+If you want to bind to host folders for local testing:
+
+```yaml
+services:
+  api:
+    volumes:
+      - /absolute/local/path/content:/data/content
+      - /absolute/local/path/epub-source:/data/epub-source
+```
+
+If you want to use NFS-backed docker volumes, define them under `volumes:`. Example:
+
+```yaml
+volumes:
+  nas_chapter_content:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=100.93.79.10,nolock,soft,rw
+      device: ":/volume2/apps/reader-content"
+
+  nas_epub_source:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=100.93.79.10,nolock,soft,rw
+      device: ":/volume2/apps/reader-epub"
+```
+
+For your EPUB structure (folder per novel, multiple `.epub` parts inside), mount the parent folder to `/data/epub-source`.
+
 ## Implemented Endpoints
 
 - GET /api/health
@@ -108,6 +153,52 @@ Notes:
 - POST /api/truyen/{id}/rate
 - GET /api/truyen/suggest
 - GET /api/chapters/{chapterId}
+
+## NAS Migration Ops
+
+### 1) Apply SQL migration manually
+
+Run SQL in `migrations/2026_04_nas_content_storage.sql` against PostgreSQL.
+
+### 2) Backfill existing chapter content from Mongo -> NAS + ChapterContentRef
+
+Dry-run first:
+
+```bash
+python scripts/backfill_chapter_content_refs.py --limit 1000 --dry-run
+```
+
+Then execute:
+
+```bash
+python scripts/backfill_chapter_content_refs.py --limit 1000
+```
+
+You can run multiple batches by increasing/changing `--limit`.
+
+Checkpoint/resume mode:
+
+```bash
+python scripts/backfill_chapter_content_refs.py --limit 1000 --state-file .backfill_state.json
+```
+
+Or continue from a known ObjectId:
+
+```bash
+python scripts/backfill_chapter_content_refs.py --limit 1000 --after-id 680f7f3a2f0d53f4f2b7a123
+```
+
+## Chapter Read Cutover Flag
+
+Set in `.env`:
+
+```env
+CHAPTER_CONTENT_MODE=nas_first
+```
+
+Values:
+- `nas_first` (default): read NAS ref first, fallback Mongo.
+- `mongo_first`: keep Mongo-first during cautious rollout.
 
 ## Notes
 

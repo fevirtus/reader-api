@@ -12,3 +12,8 @@ build/
 .env.local
 # Local debug/test scripts
 test_*.py
+
+# Local NAS mount test data
+data/epub-source/*
+data/content/*
+data/nas-content/*

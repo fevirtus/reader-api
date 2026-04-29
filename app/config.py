@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_bucket_name: str = ""
     r2_public_base_url: str = ""
+    nas_content_root: str = "./data/content"
+    epub_source_root: str = "./data/epub-source"
+    chapter_content_mode: str = "nas_first"  # nas_first | mongo_first
 
     deepseek_key: str = ""
     deepseek_model: str = "deepseek-chat"

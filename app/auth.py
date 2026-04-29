@@ -121,7 +121,10 @@ async def resolve_current_user(db: AsyncSession, request: Request) -> dict[str, 
     return await _get_user_from_session_cookie(db, request)
 
 
-async def require_current_user(db: AsyncSession, request: Request) -> dict[str, Any]:
+async def require_current_user(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
     user = await resolve_current_user(db, request)
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
