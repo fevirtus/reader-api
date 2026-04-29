@@ -12,6 +12,8 @@ RUN uv sync --no-dev
 
 COPY app ./app
 COPY prisma ./prisma
+COPY scripts ./scripts
+COPY migrations ./migrations
 
 EXPOSE 8000
 
