@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
 
     database_url: str
-    mongodb_uri: str
+    mongodb_uri: str = ""
 
     google_client_id: str = ""
     nextauth_secret: str = ""
@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     nas_content_root: str = "./data/content"
     epub_source_root: str = "./data/epub-source"
     chapter_content_mode: str = "nas_first"  # nas_first | mongo_first
+    auto_schema_bootstrap: str = "false"
 
     deepseek_key: str = ""
     deepseek_model: str = "deepseek-chat"

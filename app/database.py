@@ -1,4 +1,3 @@
-from motor.motor_asyncio import AsyncIOMotorClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import settings
@@ -32,10 +31,6 @@ def _normalize_database_url(url: str) -> str:
 
 engine = create_async_engine(_normalize_database_url(settings.database_url), pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-mongo_client = AsyncIOMotorClient(settings.mongodb_uri)
-mongo_db = mongo_client.get_default_database()
-
 
 async def get_db_session() -> AsyncSession:
     session = SessionLocal()

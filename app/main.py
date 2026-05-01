@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from bson import ObjectId
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport import requests as google_requests
@@ -19,17 +18,16 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user
-from app.routers import mod
 from app.config import settings
-from app.database import get_db_session, mongo_client, mongo_db
+from app.database import get_db_session
 from app.storage import storage
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await _ensure_migration_tables()
+    if str(settings.auto_schema_bootstrap).lower() in {"1", "true", "yes", "on"}:
+        await _ensure_migration_tables()
     yield
-    mongo_client.close()
 
 
 async def _ensure_migration_tables() -> None:
@@ -74,6 +72,20 @@ async def _ensure_migration_tables() -> None:
         )
         ''',
         '''
+        CREATE TABLE IF NOT EXISTS "ChapterMeta" (
+            id TEXT PRIMARY KEY,
+            "novelId" TEXT NOT NULL,
+            number INT NOT NULL,
+            title TEXT,
+            views INT NOT NULL DEFAULT 0,
+            "volumeNumber" INT,
+            "volumeTitle" TEXT,
+            "volumeChapterNumber" INT,
+            "createdAt" TIMESTAMPTZ,
+            UNIQUE("novelId", number)
+        )
+        ''',
+        '''
         CREATE TABLE IF NOT EXISTS "AssetNovelMapping" (
             id TEXT PRIMARY KEY,
             "sourceAssetId" TEXT NOT NULL REFERENCES "SourceAsset"(id) ON DELETE CASCADE,
@@ -83,6 +95,32 @@ async def _ensure_migration_tables() -> None:
             "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
+        ''',
+        '''
+        CREATE TABLE IF NOT EXISTS "UserRecommendationDoc" (
+            id TEXT PRIMARY KEY,
+            "userId" TEXT NOT NULL,
+            "novelId" TEXT NOT NULL,
+            content TEXT,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        ''',
+        '''
+        CREATE UNIQUE INDEX IF NOT EXISTS "UserRecommendationDoc_user_novel_key"
+        ON "UserRecommendationDoc"("userId", "novelId")
+        ''',
+        '''
+        CREATE TABLE IF NOT EXISTS "EditorRecommendationDoc" (
+            id TEXT PRIMARY KEY,
+            "editorId" TEXT NOT NULL,
+            "novelId" TEXT NOT NULL,
+            content TEXT,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS "EditorRecommendationDoc_novel_idx"
+        ON "EditorRecommendationDoc"("novelId")
         ''',
     ]
 
@@ -97,8 +135,6 @@ async def _ensure_migration_tables() -> None:
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
-
-app.include_router(mod.router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -268,8 +304,18 @@ async def _fetch_home_random_pool(db: AsyncSession, *, take: int = 420) -> list[
 
 
 async def _fetch_home_manual_recommendations(db: AsyncSession) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    editor_docs = await mongo_db["editorrecommendations"].find({}).sort("createdAt", -1).limit(2000).to_list(2000)
-    user_docs = await mongo_db["userrecommendations"].find({}).sort("createdAt", -1).limit(5000).to_list(5000)
+    editor_rows = (
+        await db.execute(
+            text('SELECT id, "editorId", "novelId", content, "createdAt" FROM "EditorRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 2000')
+        )
+    ).mappings().all()
+    user_rows = (
+        await db.execute(
+            text('SELECT id, "userId", "novelId", content, "createdAt" FROM "UserRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 5000')
+        )
+    ).mappings().all()
+    editor_docs = [dict(r) for r in editor_rows]
+    user_docs = [dict(r) for r in user_rows]
 
     novel_ids = list(
         {
@@ -391,10 +437,14 @@ async def _fetch_home_recent_comments(db: AsyncSession, *, take: int = 10) -> li
 
 
 async def _fetch_home_latest_novels(db: AsyncSession, *, take: int = 5) -> list[dict[str, Any]]:
-    recent_chapters = await mongo_db["chapters"].find(
-        {},
-        {"novelId": 1, "number": 1, "title": 1, "createdAt": 1},
-    ).sort("_id", -1).limit(400).to_list(400)
+    recent_chapters = (
+        await db.execute(
+            text(
+                'SELECT id, "novelId", number, title, "createdAt" '
+                'FROM "ChapterMeta" ORDER BY "createdAt" DESC NULLS LAST, id DESC LIMIT 400'
+            )
+        )
+    ).mappings().all()
 
     latest_novel_ids: list[str] = []
     latest_seen_ids: set[str] = set()
@@ -619,7 +669,6 @@ async def _update_reading_progress(
 @app.get("/api/health")
 async def healthcheck(db: AsyncSession = Depends(get_db_session)):
     db_ok = False
-    mongo_ok = False
 
     try:
         await db.execute(text("SELECT 1"))
@@ -627,18 +676,12 @@ async def healthcheck(db: AsyncSession = Depends(get_db_session)):
     except Exception:
         db_ok = False
 
-    try:
-        await mongo_db.command("ping")
-        mongo_ok = True
-    except Exception:
-        mongo_ok = False
-
-    status = "ok" if db_ok and mongo_ok else "degraded"
+    status = "ok" if db_ok else "degraded"
     return {
         "status": status,
         "service": settings.app_name,
         "environment": settings.app_env,
-        "checks": {"postgres": db_ok, "mongodb": mongo_ok},
+        "checks": {"postgres": db_ok},
     }
 
 
@@ -944,22 +987,26 @@ async def get_novel_chapters(
     novel_id: str,
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db_session),
 ):
     skip = (page - 1) * limit
-    chapters_cursor = (
-        mongo_db["chapters"]
-        .find({"novelId": novel_id}, {"title": 1, "number": 1, "createdAt": 1, "views": 1, "volumeNumber": 1, "volumeTitle": 1, "volumeChapterNumber": 1})
-        .sort("number", 1)
-        .skip(skip)
-        .limit(limit)
-    )
-    chapters = await chapters_cursor.to_list(length=limit)
-    total_chapters = await mongo_db["chapters"].count_documents({"novelId": novel_id})
+    chapters = (
+        await db.execute(
+            text(
+                'SELECT id, number, title, views, "volumeNumber", "volumeTitle", "volumeChapterNumber", "createdAt" '
+                'FROM "ChapterMeta" WHERE "novelId" = :novel_id ORDER BY number ASC OFFSET :skip LIMIT :limit'
+            ),
+            {"novel_id": novel_id, "skip": skip, "limit": limit},
+        )
+    ).mappings().all()
+    total_chapters = (
+        await db.execute(text('SELECT COUNT(*)::int FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    ).scalar_one()
 
     return {
         "chapters": [
             {
-                "id": str(item.get("_id")),
+                "id": str(item.get("id")),
                 "number": item.get("number"),
                 "title": item.get("title"),
                 "views": item.get("views", 0),
@@ -978,27 +1025,42 @@ async def get_novel_chapters(
 
 @app.get("/api/truyen/{novel_id}/chapters/by-number/{chapter_number}")
 async def get_chapter_by_number(novel_id: str, chapter_number: int, db: AsyncSession = Depends(get_db_session)):
-    chapter = await mongo_db["chapters"].find_one({"novelId": novel_id, "number": chapter_number})
+    chapter = (
+        await db.execute(
+            text(
+                'SELECT id, "novelId", number, title, views, "volumeNumber", "volumeTitle", "volumeChapterNumber", "createdAt" '
+                'FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'
+            ),
+            {"novel_id": novel_id, "number": chapter_number},
+        )
+    ).mappings().first()
     if not chapter:
         raise HTTPException(status_code=404, detail="Chapter not found")
 
-    prev_chapter = await mongo_db["chapters"].find_one(
-        {"novelId": novel_id, "number": chapter_number - 1},
-        {"number": 1},
-    )
-    next_chapter = await mongo_db["chapters"].find_one(
-        {"novelId": novel_id, "number": chapter_number + 1},
-        {"number": 1},
-    )
-    max_chapter = await mongo_db["chapters"].count_documents({"novelId": novel_id})
+    prev_chapter = (
+        await db.execute(
+            text('SELECT number FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+            {"novel_id": novel_id, "number": chapter_number - 1},
+        )
+    ).mappings().first()
+    next_chapter = (
+        await db.execute(
+            text('SELECT number FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+            {"novel_id": novel_id, "number": chapter_number + 1},
+        )
+    ).mappings().first()
+    max_chapter = (
+        await db.execute(text('SELECT COUNT(*)::int FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    ).scalar_one()
 
-    await mongo_db["chapters"].update_one({"_id": chapter["_id"]}, {"$inc": {"views": 1}})
+    await db.execute(text('UPDATE "ChapterMeta" SET views = views + 1 WHERE id = :id'), {"id": chapter["id"]})
+    await db.commit()
 
-    chapter_id = str(chapter.get("_id"))
-    content = await _resolve_chapter_content(chapter_id, chapter.get("content"), db)
+    chapter_id = str(chapter.get("id"))
+    content = await _resolve_chapter_content(chapter_id, None, db)
 
     return {
-        "id": str(chapter.get("_id")),
+        "id": str(chapter.get("id")),
         "novelId": chapter.get("novelId"),
         "number": chapter.get("number"),
         "title": chapter.get("title"),
@@ -1016,28 +1078,35 @@ async def get_chapter_by_number(novel_id: str, chapter_number: int, db: AsyncSes
 
 @app.get("/api/chapters/{chapter_id}")
 async def get_chapter_detail(chapter_id: str, db: AsyncSession = Depends(get_db_session)):
-    try:
-        object_id = ObjectId(chapter_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid chapter id") from exc
-
-    chapter = await mongo_db["chapters"].find_one({"_id": object_id})
+    chapter = (
+        await db.execute(
+            text(
+                'SELECT id, "novelId", number, title, views, "volumeNumber", "volumeTitle", "volumeChapterNumber", "createdAt" '
+                'FROM "ChapterMeta" WHERE id = :id LIMIT 1'
+            ),
+            {"id": chapter_id},
+        )
+    ).mappings().first()
     if not chapter:
         raise HTTPException(status_code=404, detail="Chapter not found")
 
-    prev_chapter = await mongo_db["chapters"].find_one(
-        {"novelId": chapter.get("novelId"), "number": chapter.get("number", 0) - 1},
-        {"number": 1},
-    )
-    next_chapter = await mongo_db["chapters"].find_one(
-        {"novelId": chapter.get("novelId"), "number": chapter.get("number", 0) + 1},
-        {"number": 1},
-    )
+    prev_chapter = (
+        await db.execute(
+            text('SELECT id, number FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+            {"novel_id": chapter.get("novelId"), "number": int(chapter.get("number") or 0) - 1},
+        )
+    ).mappings().first()
+    next_chapter = (
+        await db.execute(
+            text('SELECT id, number FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+            {"novel_id": chapter.get("novelId"), "number": int(chapter.get("number") or 0) + 1},
+        )
+    ).mappings().first()
 
-    content = await _resolve_chapter_content(chapter_id, chapter.get("content"), db)
+    content = await _resolve_chapter_content(chapter_id, None, db)
 
     return {
-        "id": str(chapter.get("_id")),
+        "id": str(chapter.get("id")),
         "novelId": chapter.get("novelId"),
         "number": chapter.get("number"),
         "title": chapter.get("title"),
@@ -1047,9 +1116,9 @@ async def get_chapter_detail(chapter_id: str, db: AsyncSession = Depends(get_db_
         "volumeTitle": chapter.get("volumeTitle"),
         "volumeChapterNumber": chapter.get("volumeChapterNumber"),
         "createdAt": _iso(chapter.get("createdAt")),
-        "prevChapterId": str(prev_chapter.get("_id")) if prev_chapter else None,
+        "prevChapterId": str(prev_chapter.get("id")) if prev_chapter else None,
         "prevChapterNumber": prev_chapter.get("number") if prev_chapter else None,
-        "nextChapterId": str(next_chapter.get("_id")) if next_chapter else None,
+        "nextChapterId": str(next_chapter.get("id")) if next_chapter else None,
         "nextChapterNumber": next_chapter.get("number") if next_chapter else None,
     }
 
@@ -1139,11 +1208,9 @@ def _asset_file_sha256(path: Path) -> str:
 
 
 def _extract_epub_chapters(epub_path: Path) -> list[dict[str, Any]]:
-    from app.routers.mod import _build_chapters_from_toc, _epub_html_to_text, _postprocess_extracted_chapters
-    from ebooklib import epub as epublib
+    from app.epub_parser import build_chapters_from_epub
 
-    book = epublib.read_epub(str(epub_path), options={"ignore_ncx": False})
-    extracted = _postprocess_extracted_chapters(_build_chapters_from_toc(book), "toc")
+    extracted = build_chapters_from_epub(epub_path)
 
     chapters: list[dict[str, Any]] = []
     for idx, ch in enumerate(extracted, start=1):
@@ -1155,7 +1222,7 @@ def _extract_epub_chapters(epub_path: Path) -> list[dict[str, Any]]:
                 "number": int(ch.get("number") or idx),
                 "title": str(ch.get("title") or f"Chapter {idx}"),
                 "raw_html": content,
-                "txt": _epub_html_to_text(content).strip(),
+                "txt": str(ch.get("txt") or "").strip(),
             }
         )
     return chapters
@@ -1192,6 +1259,7 @@ async def list_source_assets(
     status: str | None = None,
     unconvertedOnly: bool = Query(default=False),
     q: str | None = None,
+    offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
     db: AsyncSession = Depends(get_db_session),
 ):
@@ -1203,8 +1271,9 @@ async def list_source_assets(
 
     if unconvertedOnly:
         where_parts.append(
-            'NOT EXISTS (SELECT 1 FROM "ImportJob" j WHERE j."sourceAssetId" = s.id AND j.status = :completed_status)'
+            '(s.status <> :asset_completed_status AND NOT EXISTS (SELECT 1 FROM "ImportJob" j WHERE j."sourceAssetId" = s.id AND j.status = :completed_status))'
         )
+        params["asset_completed_status"] = "completed"
         params["completed_status"] = "completed"
 
     if q and q.strip():
@@ -1219,12 +1288,63 @@ async def list_source_assets(
         await db.execute(
             text(
                 f'SELECT id, path, sha256, opf_identifier, title, author, status, "createdAt", "updatedAt" '
-                f'FROM "SourceAsset" s {where_sql} ORDER BY s."updatedAt" DESC LIMIT :limit'
+                f'FROM "SourceAsset" s {where_sql} ORDER BY s."updatedAt" DESC OFFSET :offset LIMIT :limit'
             ),
-            params,
+            {**params, "offset": offset},
         )
     ).mappings().all()
     return [dict(r) for r in rows]
+
+
+@app.post("/api/import/assets/auto-review")
+async def auto_review_assets(
+    limit: int = Query(default=1000, ge=1, le=10000),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    def normalize(v: str) -> str:
+        v = (v or "").strip().lower()
+        frm = "áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ"
+        to = "aaaaaaaaaaaaaaaaaeeeeeeeeeeeiiiiiooooooooooooooooouuuuuuuuuuuyyyyyd"
+        v = v.translate(str.maketrans(frm, to))
+        return "".join(ch for ch in v if ch.isalnum() or ch.isspace()).strip()
+
+    novel_rows = (
+        await db.execute(text('SELECT id, title, slug FROM "Novel"'))
+    ).mappings().all()
+    known = {normalize(str(r.get("title") or "")) for r in novel_rows}
+    known.update({normalize(str(r.get("slug") or "")) for r in novel_rows})
+
+    assets = (
+        await db.execute(
+            text('SELECT id, path, status FROM "SourceAsset" WHERE status IN (:d,:a,:r) ORDER BY "updatedAt" DESC LIMIT :limit'),
+            {"d": "discovered", "a": "approved", "r": "review_required", "limit": limit},
+        )
+    ).mappings().all()
+
+    approved = 0
+    review_required = 0
+    for a in assets:
+        path = str(a.get("path") or "")
+        base = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        folder = path.split("/", 1)[0] if "/" in path else base
+        key = normalize(base)
+        alt = normalize(folder)
+        status = "approved" if (key in known or alt in known) else "review_required"
+        await db.execute(
+            text('UPDATE "SourceAsset" SET status = :status, "updatedAt" = NOW() WHERE id = :id'),
+            {"id": a["id"], "status": status},
+        )
+        if status == "approved":
+            approved += 1
+        else:
+            review_required += 1
+
+    await db.commit()
+    return {"processed": len(assets), "approved": approved, "reviewRequired": review_required}
 
 
 @app.post("/api/import/assets/upsert")
@@ -1348,6 +1468,66 @@ async def approve_source_asset(
         raise HTTPException(status_code=404, detail="Source asset not found")
     await db.commit()
     return dict(row)
+
+
+@app.post("/api/import/assets/{asset_id}/mark-converted")
+async def mark_source_asset_converted(
+    asset_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = (
+        await db.execute(
+            text('UPDATE "SourceAsset" SET status = :status, "updatedAt" = NOW() WHERE id = :id RETURNING id, status'),
+            {"id": asset_id, "status": "completed"},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    await db.execute(
+        text(
+            'INSERT INTO "ImportJob" (id, "sourceAssetId", status, error) '
+            'VALUES (:id, :asset_id, :status, :error)'
+        ),
+        {
+            "id": _new_id("job_"),
+            "asset_id": asset_id,
+            "status": "completed",
+            "error": "marked_converted_manually",
+        },
+    )
+    await db.commit()
+    return {"id": row["id"], "status": row["status"], "marked": True}
+
+
+@app.post("/api/import/assets/{asset_id}/unmark-converted")
+async def unmark_source_asset_converted(
+    asset_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = (
+        await db.execute(
+            text('UPDATE "SourceAsset" SET status = :status, "updatedAt" = NOW() WHERE id = :id RETURNING id, status'),
+            {"id": asset_id, "status": "discovered"},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    await db.execute(
+        text('DELETE FROM "ImportJob" WHERE "sourceAssetId" = :asset_id AND status = :status'),
+        {"asset_id": asset_id, "status": "completed"},
+    )
+    await db.commit()
+    return {"id": row["id"], "status": row["status"], "unmarked": True}
 
 
 @app.post("/api/import/jobs")
@@ -1495,15 +1675,17 @@ async def apply_import_job_mapping(
         if not chapter_token.isdigit():
             continue
         chapter_number = int(chapter_token)
-        chapter = await mongo_db["chapters"].find_one(
-            {"novelId": payload.novelId, "number": chapter_number},
-            {"_id": 1},
-        )
+        chapter = (
+            await db.execute(
+                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+                {"novel_id": payload.novelId, "number": chapter_number},
+            )
+        ).mappings().first()
         if not chapter:
             missing += 1
             continue
 
-        chapter_id = str(chapter.get("_id"))
+        chapter_id = str(chapter.get("id"))
         txt_href = f"{asset_id}/{chapter_number}.txt"
         raw_href = f"{asset_id}/{chapter_number}.raw.html"
         content_hash = hashlib.sha256(storage.read_text(txt_href).encode("utf-8")).hexdigest()
@@ -1616,10 +1798,12 @@ async def get_missing_mappings(
         if not token.isdigit():
             continue
         chapter_number = int(token)
-        chapter = await mongo_db["chapters"].find_one(
-            {"novelId": novelId, "number": chapter_number},
-            {"_id": 1},
-        )
+        chapter = (
+            await db.execute(
+                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+                {"novel_id": novelId, "number": chapter_number},
+            )
+        ).mappings().first()
         if not chapter:
             missing.append(
                 {
@@ -1655,10 +1839,12 @@ async def manual_map_chapter(
     except Exception as exc:
         raise HTTPException(status_code=404, detail="Source chapter content not found") from exc
 
-    target = await mongo_db["chapters"].find_one(
-        {"_id": ObjectId(payload.targetChapterId), "novelId": payload.novelId},
-        {"_id": 1},
-    )
+    target = (
+        await db.execute(
+            text('SELECT id FROM "ChapterMeta" WHERE id = :id AND "novelId" = :novel_id LIMIT 1'),
+            {"id": payload.targetChapterId, "novel_id": payload.novelId},
+        )
+    ).mappings().first()
     if not target:
         raise HTTPException(status_code=404, detail="Target chapter not found for novel")
 
@@ -1810,15 +1996,17 @@ async def get_mapping_progress(
             continue
         chapter_number = int(token)
         total += 1
-        chapter = await mongo_db["chapters"].find_one(
-            {"novelId": novelId, "number": chapter_number},
-            {"_id": 1},
-        )
+        chapter = (
+            await db.execute(
+                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+                {"novel_id": novelId, "number": chapter_number},
+            )
+        ).mappings().first()
         if not chapter:
             missing_numbers.append(chapter_number)
             continue
 
-        chapter_id = str(chapter.get("_id"))
+        chapter_id = str(chapter.get("id"))
         ref = (
             await db.execute(
                 text('SELECT "chapterId" FROM "ChapterContentRef" WHERE "chapterId" = :id LIMIT 1'),
@@ -1875,10 +2063,15 @@ async def auto_complete_import_job(
             continue
         chapter_number = int(token)
         total += 1
-        chapter = await mongo_db["chapters"].find_one({"novelId": novelId, "number": chapter_number}, {"_id": 1})
+        chapter = (
+            await db.execute(
+                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+                {"novel_id": novelId, "number": chapter_number},
+            )
+        ).mappings().first()
         if not chapter:
             continue
-        chapter_id = str(chapter.get("_id"))
+        chapter_id = str(chapter.get("id"))
         ref = (
             await db.execute(
                 text('SELECT "chapterId" FROM "ChapterContentRef" WHERE "chapterId" = :id LIMIT 1'),
@@ -2394,12 +2587,14 @@ async def list_recommendations(request: Request, db: AsyncSession = Depends(get_
     user = await require_current_user(request, db)
 
     docs = (
-        await mongo_db["userrecommendations"]
-        .find({"userId": user["id"]})
-        .sort("createdAt", -1)
-        .limit(1000)
-        .to_list(length=1000)
-    )
+        await db.execute(
+            text(
+                'SELECT id, "novelId", "createdAt" FROM "UserRecommendationDoc" '
+                'WHERE "userId" = :user_id ORDER BY "createdAt" DESC LIMIT 1000'
+            ),
+            {"user_id": user["id"]},
+        )
+    ).mappings().all()
 
     novel_ids = list({doc.get("novelId") for doc in docs if doc.get("novelId")})
     novel_map: dict[str, dict[str, Any]] = {}
@@ -2423,7 +2618,7 @@ async def list_recommendations(request: Request, db: AsyncSession = Depends(get_
             continue
         items.append(
             {
-                "id": str(doc.get("_id")),
+                "id": str(doc.get("id")),
                 "novelId": novel_id,
                 "createdAt": _iso(doc.get("createdAt")),
                 "novel": novel_map[novel_id],
@@ -2454,20 +2649,23 @@ async def create_recommendation(
     if not novel_exists:
         raise HTTPException(status_code=404, detail="Truyện không tồn tại")
 
-    existing = await mongo_db["userrecommendations"].find_one(
-        {"userId": user["id"], "novelId": payload.novelId}, {"_id": 1}
-    )
+    existing = (
+        await db.execute(
+            text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
+            {"user_id": user["id"], "novel_id": payload.novelId},
+        )
+    ).mappings().first()
     if existing:
         raise HTTPException(status_code=409, detail="Bạn đã đề cử truyện này rồi")
 
     now = dt.datetime.now(dt.timezone.utc)
-    result = await mongo_db["userrecommendations"].insert_one(
-        {
-            "userId": user["id"],
-            "novelId": payload.novelId,
-            "createdAt": now,
-            "updatedAt": now,
-        }
+    rec_id = _new_id("urec_")
+    await db.execute(
+        text(
+            'INSERT INTO "UserRecommendationDoc" (id, "userId", "novelId", "createdAt") '
+            'VALUES (:id, :user_id, :novel_id, :created_at)'
+        ),
+        {"id": rec_id, "user_id": user["id"], "novel_id": payload.novelId, "created_at": now},
     )
 
     await db.execute(
@@ -2476,7 +2674,7 @@ async def create_recommendation(
     )
     await db.commit()
 
-    return {"id": str(result.inserted_id), "novelId": payload.novelId}
+    return {"id": rec_id, "novelId": payload.novelId}
 
 
 @app.delete("/api/user/recommendations")
@@ -2487,13 +2685,19 @@ async def delete_recommendation(
 ):
     user = await require_current_user(request, db)
 
-    existing = await mongo_db["userrecommendations"].find_one(
-        {"userId": user["id"], "novelId": novelId}, {"_id": 1}
-    )
+    existing = (
+        await db.execute(
+            text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
+            {"user_id": user["id"], "novel_id": novelId},
+        )
+    ).mappings().first()
     if not existing:
         raise HTTPException(status_code=404, detail="Bạn chưa đề cử truyện này")
 
-    await mongo_db["userrecommendations"].delete_one({"_id": existing["_id"]})
+    await db.execute(
+        text('DELETE FROM "UserRecommendationDoc" WHERE id = :id'),
+        {"id": existing["id"]},
+    )
     await db.execute(
         text('UPDATE "Novel" SET "bookmarkCount" = GREATEST("bookmarkCount" - 1, 0) WHERE id = :novel_id'),
         {"novel_id": novelId},
