@@ -12,7 +12,6 @@ This project is Python-first (FastAPI), with production-focused Docker setup and
 - FastAPI
 - UV (package manager / runner)
 - PostgreSQL (structured data)
-- MongoDB (chapter content + user recommendations)
 
 ## API Base URL
 
@@ -27,7 +26,6 @@ Required keys:
 
 ```env
 DATABASE_URL=postgresql://reader:reader@localhost:5432/reader
-MONGODB_URI=mongodb://localhost:27017/reader
 NEXTAUTH_SECRET=replace-with-strong-secret
 MOBILE_JWT_SECRET=replace-with-strong-secret
 # Comma-separated allowed Google OAuth client IDs
@@ -79,15 +77,15 @@ WEB_GOOGLE_CLIENT_ID=web-client-id.apps.googleusercontent.com
 WEB_GOOGLE_CLIENT_SECRET=replace-with-web-google-client-secret
 ```
 
-### Full local stack (API local + Postgres + Mongo)
+### Full local stack (API local + Postgres)
 
 ```bash
-docker compose --profile localdb up -d --build api-local postgres mongo
+docker compose --profile localdb up -d --build api-local postgres
 ```
 
 Notes:
 - `api` listens on port `8000` and is intended for external DB deployments.
-- `api-local` listens on port `8001` and automatically points to `postgres` + `mongo` containers.
+- `api-local` listens on port `8001` and automatically points to `postgres` container.
 - `web` listens on port `3000` and calls API internally through `http://api:8000`.
 
 ### NAS mount points (chapter content + EPUB source)
@@ -153,6 +151,29 @@ For your EPUB structure (folder per novel, multiple `.epub` parts inside), mount
 - POST /api/truyen/{id}/rate
 - GET /api/truyen/suggest
 - GET /api/chapters/{chapterId}
+- GET /api/import/assets/search
+- GET /api/import/assets/{assetId}/preview-metadata
+- POST /api/import/assets/{assetId}/ai-suggest
+- POST /api/import/assets/{assetId}/review
+- POST /api/import/assets/{assetId}/parse-preview
+- POST /api/import/assets/{assetId}/start-import
+- GET /api/import/sessions/{sessionId}
+
+## Simple EPUB Import Flow (Review-first)
+
+MOD/ADMIN flow on new import wizard:
+
+1. Search source EPUB by name (DB index): `GET /api/import/assets/search`
+2. Review/edit metadata: `GET /api/import/assets/{id}/preview-metadata` + `POST /api/import/assets/{id}/review`
+3. Preview chapter split (TOC or regex-start): `POST /api/import/assets/{id}/parse-preview`
+4. Start import and poll progress:
+   - `POST /api/import/assets/{id}/start-import`
+   - `GET /api/import/sessions/{sessionId}`
+
+AI assist in step 2:
+- `POST /api/import/assets/{id}/ai-suggest`
+- Returns up to 6 genres + 1 short description.
+- New genres are allowed and created immediately on apply.
 
 ## NAS Migration Ops
 
@@ -160,7 +181,7 @@ For your EPUB structure (folder per novel, multiple `.epub` parts inside), mount
 
 Run SQL in `migrations/2026_04_nas_content_storage.sql` against PostgreSQL.
 
-### 2) Backfill existing chapter content from Mongo -> NAS + ChapterContentRef
+### 2) Backfill existing chapter content to NAS + ChapterContentRef
 
 Dry-run first:
 
@@ -197,8 +218,7 @@ CHAPTER_CONTENT_MODE=nas_first
 ```
 
 Values:
-- `nas_first` (default): read NAS ref first, fallback Mongo.
-- `mongo_first`: keep Mongo-first during cautious rollout.
+- `nas_first` (default): read NAS ref first.
 
 ## Notes
 

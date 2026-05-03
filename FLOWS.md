@@ -36,3 +36,23 @@ Backend flow theo domain, de web/mobile follow giong nhau.
 - Comments: `/api/truyen/{id}/comments`.
 - Rating: `/api/truyen/{id}/rate`.
 - Rule: enforce auth + anti-invalid payload + stable error format.
+
+## Flow E: EPUB Import (MOD/ADMIN)
+
+- Step 1 search source:
+  - `/api/import/assets/search`
+- Step 2 review metadata:
+  - `/api/import/assets/{id}/preview-metadata`
+  - `/api/import/assets/{id}/ai-suggest`
+  - `/api/import/assets/{id}/review`
+- Step 3 chapter split preview:
+  - `/api/import/assets/{id}/parse-preview`
+  - split mode: `toc` or `regex` (chapter-start pattern only)
+- Step 4 start import + progress:
+  - `/api/import/assets/{id}/start-import`
+  - `/api/import/sessions/{sessionId}`
+
+Rules:
+- No filesystem scan in search request path (scan by cron/incremental).
+- Reviewer confirms metadata before import.
+- Import writes NAS content + chapter refs, then updates novel counters.

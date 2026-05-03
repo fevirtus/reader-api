@@ -18,6 +18,7 @@ Tinh nang backend cho web + mobile.
 | Domain | Endpoint Group | Status | Notes |
 |---|---|---|---|
 | Content management | `/api/mod/*` | partial | da co nhieu route, tiep tuc bo sung nhu cau |
+| EPUB import | `/api/import/*` | done | review-first wizard APIs + progress session |
 
 ## Contract + Parity Responsibility
 

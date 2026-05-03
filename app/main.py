@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
+import json
+import os
 import random
+import re
 import secrets
+import tempfile
 import uuid
+from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+import boto3
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
+from fastapi.responses import Response
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel, Field
@@ -25,9 +34,18 @@ from app.storage import storage
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _SCAN_TASK
     if str(settings.auto_schema_bootstrap).lower() in {"1", "true", "yes", "on"}:
         await _ensure_migration_tables()
+    if _SCAN_TASK is None or _SCAN_TASK.done():
+        _SCAN_TASK = asyncio.create_task(_scan_loop(), name="import-scan-loop")
     yield
+    if _SCAN_TASK and not _SCAN_TASK.done():
+        _SCAN_TASK.cancel()
+        try:
+            await _SCAN_TASK
+        except asyncio.CancelledError:
+            pass
 
 
 async def _ensure_migration_tables() -> None:
@@ -50,6 +68,33 @@ async def _ensure_migration_tables() -> None:
         ''',
         '''
         CREATE UNIQUE INDEX IF NOT EXISTS "SourceAsset_sha256_key" ON "SourceAsset"(sha256)
+        ''',
+        '''
+        ALTER TABLE "SourceAsset"
+            ADD COLUMN IF NOT EXISTS search_name TEXT,
+            ADD COLUMN IF NOT EXISTS size_bytes BIGINT,
+            ADD COLUMN IF NOT EXISTS mtime_epoch BIGINT,
+            ADD COLUMN IF NOT EXISTS "lastScannedAt" TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'discovered',
+            ADD COLUMN IF NOT EXISTS review_payload JSONB
+        ''',
+        '''
+        CREATE INDEX IF NOT EXISTS "SourceAsset_search_name_idx" ON "SourceAsset"(search_name)
+        ''',
+        '''
+        CREATE TABLE IF NOT EXISTS "ImportSession" (
+            id TEXT PRIMARY KEY,
+            "sourceAssetId" TEXT NOT NULL REFERENCES "SourceAsset"(id) ON DELETE CASCADE,
+            "novelId" TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            phase TEXT NOT NULL DEFAULT 'prepare',
+            "progressPct" DOUBLE PRECISION NOT NULL DEFAULT 0,
+            log TEXT,
+            "resultJson" JSONB,
+            "createdBy" TEXT,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
         ''',
         '''
         CREATE TABLE IF NOT EXISTS "ImportJob" (
@@ -78,11 +123,21 @@ async def _ensure_migration_tables() -> None:
             number INT NOT NULL,
             title TEXT,
             views INT NOT NULL DEFAULT 0,
-            "volumeNumber" INT,
-            "volumeTitle" TEXT,
-            "volumeChapterNumber" INT,
             "createdAt" TIMESTAMPTZ,
             UNIQUE("novelId", number)
+        )
+        ''',
+        '''
+        CREATE TABLE IF NOT EXISTS "ImportCandidateChapter" (
+            id TEXT PRIMARY KEY,
+            "jobId" TEXT NOT NULL,
+            "candidateNumber" INT NOT NULL,
+            "candidateTitle" TEXT,
+            "candidateHash" TEXT,
+            "matchedChapterId" TEXT,
+            action TEXT NOT NULL,
+            reason TEXT,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         ''',
         '''
@@ -135,6 +190,98 @@ async def _ensure_migration_tables() -> None:
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+_SCAN_TASK: asyncio.Task[Any] | None = None
+_IMPORT_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _normalized_search_name(value: str) -> str:
+    raw = (value or "").replace("\\", "/")
+    base = raw.split("/")[-1]
+    stem = base.rsplit(".", 1)[0]
+    return _norm_title(stem)
+
+
+async def _discover_assets_incremental(limit: int = 2000) -> dict[str, int]:
+    from app.database import SessionLocal
+
+    root = Path(settings.epub_source_root)
+    if not root.exists():
+        return {"scanned": 0, "discovered": 0, "updated": 0}
+
+    found = sorted(root.rglob("*.epub"))[: max(1, limit)]
+    discovered = 0
+    updated = 0
+    scanned = 0
+
+    session = SessionLocal()
+    try:
+        for epub_path in found:
+            stat = epub_path.stat()
+            rel_path = str(epub_path.relative_to(root))
+            scanned += 1
+            sha256_now = _asset_file_sha256(epub_path)
+            existing = (
+                await session.execute(
+                    text('SELECT id, sha256, size_bytes, mtime_epoch FROM "SourceAsset" WHERE sha256 = :sha LIMIT 1'),
+                    {"sha": sha256_now},
+                )
+            ).mappings().first()
+            changed = (
+                not existing
+                or int(existing.get("size_bytes") or -1) != int(stat.st_size)
+                or int(existing.get("mtime_epoch") or -1) != int(stat.st_mtime)
+            )
+            sha256 = sha256_now if changed else str(existing.get("sha256") or sha256_now)
+            now_epoch = int(stat.st_mtime)
+
+            if existing:
+                await session.execute(
+                    text(
+                        'UPDATE "SourceAsset" SET sha256 = :sha, size_bytes = :size, mtime_epoch = :mtime, '
+                        'search_name = :search_name, "lastScannedAt" = NOW(), "updatedAt" = NOW() WHERE id = :id'
+                    ),
+                    {
+                        "id": existing["id"],
+                        "sha": sha256,
+                        "size": int(stat.st_size),
+                        "mtime": now_epoch,
+                        "search_name": _normalized_search_name(rel_path),
+                    },
+                )
+                updated += 1
+            else:
+                await session.execute(
+                    text(
+                        'INSERT INTO "SourceAsset" (id, path, sha256, status, search_name, size_bytes, mtime_epoch, "lastScannedAt") '
+                        'VALUES (:id, :path, :sha, :status, :search_name, :size, :mtime, NOW())'
+                    ),
+                    {
+                        "id": _new_id("asset_"),
+                        "path": rel_path,
+                        "sha": sha256,
+                        "status": "discovered",
+                        "search_name": _normalized_search_name(rel_path),
+                        "size": int(stat.st_size),
+                        "mtime": now_epoch,
+                    },
+                )
+                discovered += 1
+        await session.commit()
+    finally:
+        await session.close()
+
+    return {"scanned": scanned, "discovered": discovered, "updated": updated}
+
+
+async def _scan_loop() -> None:
+    interval_seconds = max(60, int(settings.import_scan_interval_minutes) * 60)
+    while True:
+        try:
+            await _discover_assets_incremental(limit=settings.import_scan_limit)
+        except Exception:
+            pass
+        await asyncio.sleep(interval_seconds)
 
 app.add_middleware(
     CORSMiddleware,
@@ -304,16 +451,19 @@ async def _fetch_home_random_pool(db: AsyncSession, *, take: int = 420) -> list[
 
 
 async def _fetch_home_manual_recommendations(db: AsyncSession) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    editor_rows = (
-        await db.execute(
-            text('SELECT id, "editorId", "novelId", content, "createdAt" FROM "EditorRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 2000')
-        )
-    ).mappings().all()
-    user_rows = (
-        await db.execute(
-            text('SELECT id, "userId", "novelId", content, "createdAt" FROM "UserRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 5000')
-        )
-    ).mappings().all()
+    try:
+        editor_rows = (
+            await db.execute(
+                text('SELECT id, "editorId", "novelId", content, "createdAt" FROM "EditorRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 2000')
+            )
+        ).mappings().all()
+        user_rows = (
+            await db.execute(
+                text('SELECT id, "userId", "novelId", content, "createdAt" FROM "UserRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 5000')
+            )
+        ).mappings().all()
+    except Exception:
+        return [], []
     editor_docs = [dict(r) for r in editor_rows]
     user_docs = [dict(r) for r in user_rows]
 
@@ -506,46 +656,6 @@ def _to_hot_slide(row: dict[str, Any], source: str) -> dict[str, Any]:
     }
 
 
-@app.get("/api/home")
-async def get_home_data(db: AsyncSession = Depends(get_db_session)):
-    today = dt.datetime.now(dt.timezone.utc).date()
-    week_start = today - dt.timedelta(days=7)
-    month_start = today - dt.timedelta(days=30)
-
-    weekly_raw = await _fetch_home_ranking_rows(db, since=week_start, take=600)
-    monthly_raw = await _fetch_home_ranking_rows(db, since=month_start, take=600)
-    all_time_raw = await _fetch_home_ranking_rows(db, take=800)
-    popular_fallback = await _fetch_home_popular_fallback(db, take=400)
-    random_pool = await _fetch_home_random_pool(db, take=420)
-    top_recommendations, editor_recommendations = await _fetch_home_manual_recommendations(db)
-    recent_comments = await _fetch_home_recent_comments(db, take=10)
-    latest_novels = await _fetch_home_latest_novels(db, take=5)
-
-    weekly_ranking = _fill_unique_rows(_collapse_series_rows(weekly_raw), _collapse_series_rows(popular_fallback), 5)
-    monthly_ranking = _fill_unique_rows(_collapse_series_rows(monthly_raw), _collapse_series_rows(popular_fallback), 5)
-    all_time_ranking = _fill_unique_rows(_collapse_series_rows(all_time_raw), _collapse_series_rows(popular_fallback), 5)
-
-    hot_primary = [_to_hot_slide(item, "week") for item in weekly_ranking[:5]] + [_to_hot_slide(item, "month") for item in monthly_ranking[:5]]
-    hot_fallback = [_to_hot_slide(item, "all") for item in all_time_ranking[:8]]
-    hot_slides = _fill_unique_rows(hot_primary, hot_fallback, 10)
-
-    used_hot_ids = {item["id"] for item in hot_slides}
-    random_candidates = [item for item in _collapse_series_rows(_shuffle_rows(random_pool)) if item["id"] not in used_hot_ids]
-    random_novels = _fill_unique_rows(random_candidates, _shuffle_rows(random_pool), 12)
-
-    return {
-        "hotSlides": hot_slides,
-        "randomNovels": random_novels,
-        "recommendedByCountItems": top_recommendations,
-        "editorRecommendedItems": editor_recommendations,
-        "weeklyRanking": weekly_ranking,
-        "monthlyRanking": monthly_ranking,
-        "allTimeRanking": all_time_ranking,
-        "latestNovels": latest_novels,
-        "recentComments": recent_comments,
-    }
-
-
 async def _load_bookmark_with_novel(db: AsyncSession, user_id: str, novel_id: str) -> dict[str, Any] | None:
     result = await db.execute(
         text(
@@ -734,6 +844,1534 @@ async def get_genre_by_slug(slug: str, db: AsyncSession = Depends(get_db_session
     row = result.mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Genre not found")
+    return dict(row)
+
+
+@app.get("/api/mod/the-loai")
+async def mod_list_genres(
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    rows = (
+        await db.execute(
+            text('SELECT id, name, slug, description, icon FROM "Genre" ORDER BY name ASC')
+        )
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/mod/the-loai")
+async def mod_create_genre(
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    name = " ".join((str(payload.get("name") or "")).split()).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên thể loại không hợp lệ")
+    slug = _norm_title(name).replace(" ", "-")[:120] or _new_id("genre_")
+
+    existing = (
+        await db.execute(
+            text('SELECT id, name, slug, description, icon FROM "Genre" WHERE lower(name) = :name OR slug = :slug LIMIT 1'),
+            {"name": name.lower(), "slug": slug},
+        )
+    ).mappings().first()
+    if existing:
+        return dict(existing)
+
+    row = (
+        await db.execute(
+            text(
+                'INSERT INTO "Genre" (id, name, slug, description, icon) '
+                'VALUES (:id, :name, :slug, :description, :icon) '
+                'RETURNING id, name, slug, description, icon'
+            ),
+            {
+                "id": _new_id("genre_"),
+                "name": name,
+                "slug": slug,
+                "description": payload.get("description"),
+                "icon": payload.get("icon"),
+            },
+        )
+    ).mappings().first()
+    await db.commit()
+    return dict(row) if row else {}
+
+
+@app.put("/api/mod/the-loai")
+async def mod_update_genre(
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    genre_id = str(payload.get("id") or "").strip()
+    if not genre_id:
+        raise HTTPException(status_code=400, detail="id là bắt buộc")
+    name = " ".join((str(payload.get("name") or "")).split()).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên thể loại không hợp lệ")
+    slug = _norm_title(name).replace(" ", "-")[:120] or genre_id
+
+    row = (
+        await db.execute(
+            text(
+                'UPDATE "Genre" SET name = :name, slug = :slug, description = :description, icon = :icon '
+                'WHERE id = :id RETURNING id, name, slug, description, icon'
+            ),
+            {
+                "id": genre_id,
+                "name": name,
+                "slug": slug,
+                "description": payload.get("description"),
+                "icon": payload.get("icon"),
+            },
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Genre not found")
+    await db.commit()
+    return dict(row)
+
+
+@app.delete("/api/mod/the-loai")
+async def mod_delete_genre(
+    id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    await db.execute(text('DELETE FROM "NovelGenre" WHERE "genreId" = :id'), {"id": id})
+    row = (
+        await db.execute(
+            text('DELETE FROM "Genre" WHERE id = :id RETURNING id, name'),
+            {"id": id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Genre not found")
+    await db.commit()
+    return {"id": row["id"], "name": row["name"], "deleted": True}
+
+
+@app.post("/api/mod/the-loai/merge")
+async def mod_merge_genre(
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    source_id = str(payload.get("sourceId") or "").strip()
+    target_id = str(payload.get("targetId") or "").strip()
+    if not source_id or not target_id:
+        raise HTTPException(status_code=400, detail="sourceId và targetId là bắt buộc")
+    if source_id == target_id:
+        raise HTTPException(status_code=400, detail="sourceId và targetId phải khác nhau")
+
+    src = (await db.execute(text('SELECT id FROM "Genre" WHERE id = :id LIMIT 1'), {"id": source_id})).mappings().first()
+    tgt = (await db.execute(text('SELECT id FROM "Genre" WHERE id = :id LIMIT 1'), {"id": target_id})).mappings().first()
+    if not src or not tgt:
+        raise HTTPException(status_code=404, detail="Genre not found")
+
+    await db.execute(
+        text(
+            'INSERT INTO "NovelGenre" ("novelId", "genreId") '
+            'SELECT "novelId", :target_id FROM "NovelGenre" WHERE "genreId" = :source_id '
+            'ON CONFLICT ("novelId", "genreId") DO NOTHING'
+        ),
+        {"source_id": source_id, "target_id": target_id},
+    )
+    await db.execute(text('DELETE FROM "NovelGenre" WHERE "genreId" = :source_id'), {"source_id": source_id})
+    await db.execute(text('DELETE FROM "Genre" WHERE id = :source_id'), {"source_id": source_id})
+    await db.commit()
+    return {"merged": True, "sourceId": source_id, "targetId": target_id}
+
+
+async def _ensure_unique_slug(db: AsyncSession, *, table: str, slug: str, current_id: str | None = None) -> str:
+    base = slug or _new_id("slug_")
+    candidate = base
+    idx = 1
+    while True:
+        row = (await db.execute(text(f'SELECT id FROM "{table}" WHERE slug = :slug LIMIT 1'), {"slug": candidate})).mappings().first()
+        if not row:
+            return candidate
+        if current_id and str(row.get("id") or "") == current_id:
+            return candidate
+        idx += 1
+        candidate = f"{base}-{idx}"
+
+
+async def _resolve_series_id(
+    db: AsyncSession,
+    *,
+    series_id: str | None,
+    series_name: str | None,
+) -> str | None:
+    sid = str(series_id or "").strip()
+    if sid:
+        exists = (await db.execute(text('SELECT id FROM "Series" WHERE id = :id LIMIT 1'), {"id": sid})).mappings().first()
+        if exists:
+            return sid
+        raise HTTPException(status_code=400, detail="Series not found")
+
+    name = " ".join((series_name or "").split()).strip()
+    if not name:
+        return None
+    slug = _norm_title(name).replace(" ", "-")[:120] or _new_id("series_")
+    existing = (
+        await db.execute(
+            text('SELECT id FROM "Series" WHERE lower(name) = :name OR slug = :slug LIMIT 1'),
+            {"name": name.lower(), "slug": slug},
+        )
+    ).mappings().first()
+    if existing:
+        return str(existing["id"])
+    sid = _new_id("series_")
+    slug = await _ensure_unique_slug(db, table="Series", slug=slug)
+    await db.execute(
+        text('INSERT INTO "Series" (id, name, slug, description, "createdAt", "updatedAt") VALUES (:id, :name, :slug, :description, NOW(), NOW())'),
+        {"id": sid, "name": name, "slug": slug, "description": None},
+    )
+    return sid
+
+
+async def _set_novel_genres(db: AsyncSession, novel_id: str, genre_ids: list[str]) -> None:
+    clean_ids = [str(g).strip() for g in (genre_ids or []) if str(g).strip()]
+    await db.execute(text('DELETE FROM "NovelGenre" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    if not clean_ids:
+        return
+    valid_rows = (
+        await db.execute(
+            text('SELECT id FROM "Genre" WHERE id = ANY(:ids)'),
+            {"ids": clean_ids},
+        )
+    ).mappings().all()
+    for r in valid_rows:
+        await db.execute(
+            text('INSERT INTO "NovelGenre" ("novelId", "genreId") VALUES (:novel_id, :genre_id) ON CONFLICT DO NOTHING'),
+            {"novel_id": novel_id, "genre_id": str(r["id"])},
+        )
+
+
+async def _delete_novel_by_id(db: AsyncSession, novel_id: str) -> bool:
+    novel_row = (
+        await db.execute(
+            text('SELECT id, "coverUrl" FROM "Novel" WHERE id = :id LIMIT 1'),
+            {"id": novel_id},
+        )
+    ).mappings().first()
+    if not novel_row:
+        return False
+
+    chapter_rows = (
+        await db.execute(
+            text(
+                'SELECT m.id, m.number, c."txtHref", c."rawHtmlHref" '
+                'FROM "ChapterMeta" m '
+                'LEFT JOIN "ChapterContentRef" c ON c."chapterId" = m.id '
+                'WHERE m."novelId" = :novel_id'
+            ),
+            {"novel_id": novel_id},
+        )
+    ).mappings().all()
+
+    for row in chapter_rows:
+        txt_href = str(row.get("txtHref") or "").strip()
+        raw_href = str(row.get("rawHtmlHref") or "").strip()
+        if txt_href:
+            try:
+                storage.delete_href(txt_href)
+            except Exception:
+                pass
+        if raw_href:
+            try:
+                storage.delete_href(raw_href)
+            except Exception:
+                pass
+
+    chapter_ids = [str(r["id"]) for r in chapter_rows]
+    if chapter_ids:
+        await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" = ANY(:chapter_ids)'), {"chapter_ids": chapter_ids})
+
+    cover_key = _r2_key_from_cover_url(str(novel_row.get("coverUrl") or ""))
+    if cover_key:
+        _delete_r2_key(cover_key)
+
+    await db.execute(text('DELETE FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    await db.execute(text('DELETE FROM "NovelGenre" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    await db.execute(text('DELETE FROM "Bookmark" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    await db.execute(text('DELETE FROM "Comment" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    await db.execute(text('DELETE FROM "NovelViewDaily" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+    deleted = (await db.execute(text('DELETE FROM "Novel" WHERE id = :id RETURNING id'), {"id": novel_id})).mappings().first()
+    return bool(deleted)
+
+
+@app.get("/api/mod/series")
+async def mod_list_series(
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    rows = (
+        await db.execute(
+            text(
+                'SELECT s.id, s.name, s.slug, s.description, COUNT(n.id)::int AS novels_count '
+                'FROM "Series" s LEFT JOIN "Novel" n ON n."seriesId" = s.id '
+                'GROUP BY s.id ORDER BY s.name ASC'
+            )
+        )
+    ).mappings().all()
+    return [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "slug": r["slug"],
+            "description": r.get("description"),
+            "_count": {"novels": int(r.get("novels_count") or 0)},
+        }
+        for r in rows
+    ]
+
+
+@app.post("/api/mod/series")
+async def mod_create_series(
+    payload: ModSeriesPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    name = " ".join((payload.name or "").split()).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên series không hợp lệ")
+    slug = _norm_title(name).replace(" ", "-")[:120] or _new_id("series_")
+    existing = (
+        await db.execute(
+            text('SELECT id, name, slug, description FROM "Series" WHERE lower(name)=:name OR slug=:slug LIMIT 1'),
+            {"name": name.lower(), "slug": slug},
+        )
+    ).mappings().first()
+    if existing:
+        return dict(existing)
+    slug = await _ensure_unique_slug(db, table="Series", slug=slug)
+    row = (
+        await db.execute(
+            text('INSERT INTO "Series" (id, name, slug, description, "createdAt", "updatedAt") VALUES (:id,:name,:slug,:description,NOW(),NOW()) RETURNING id, name, slug, description'),
+            {"id": _new_id("series_"), "name": name, "slug": slug, "description": payload.description},
+        )
+    ).mappings().first()
+    await db.commit()
+    return dict(row) if row else {}
+
+
+@app.put("/api/mod/series")
+async def mod_update_series(
+    payload: ModSeriesPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    sid = str(payload.id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="id là bắt buộc")
+    name = " ".join((payload.name or "").split()).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên series không hợp lệ")
+    slug = _norm_title(name).replace(" ", "-")[:120] or sid
+    slug = await _ensure_unique_slug(db, table="Series", slug=slug, current_id=sid)
+    row = (
+        await db.execute(
+            text('UPDATE "Series" SET name=:name, slug=:slug, description=:description, "updatedAt"=NOW() WHERE id=:id RETURNING id, name, slug, description'),
+            {"id": sid, "name": name, "slug": slug, "description": payload.description},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Series not found")
+    await db.commit()
+    return dict(row)
+
+
+@app.delete("/api/mod/series")
+async def mod_delete_series(
+    id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.execute(text('UPDATE "Novel" SET "seriesId" = NULL, "updatedAt" = NOW() WHERE "seriesId" = :id'), {"id": id})
+    row = (await db.execute(text('DELETE FROM "Series" WHERE id = :id RETURNING id'), {"id": id})).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Series not found")
+    await db.commit()
+    return {"id": id, "deleted": True}
+
+
+@app.get("/api/mod/truyen")
+async def mod_list_novels(
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    rows = (
+        await db.execute(
+            text(
+                'SELECT n.id, n.title, n.slug, n."authorName", n.status, n."totalChapters", n."coverUrl", '
+                's.id AS series_id, s.name AS series_name, s.slug AS series_slug '
+                'FROM "Novel" n LEFT JOIN "Series" s ON s.id = n."seriesId" '
+                'ORDER BY n."updatedAt" DESC, n."createdAt" DESC'
+            )
+        )
+    ).mappings().all()
+    return [
+        {
+            "id": r["id"],
+            "title": r["title"],
+            "slug": r["slug"],
+            "authorName": r.get("authorName") or "",
+            "status": r.get("status") or "Đang ra",
+            "totalChapters": int(r.get("totalChapters") or 0),
+            "coverUrl": r.get("coverUrl"),
+            "series": (
+                {"id": r["series_id"], "name": r["series_name"], "slug": r["series_slug"]}
+                if r.get("series_id")
+                else None
+            ),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/api/mod/truyen/{novel_id}")
+async def mod_get_novel_detail(
+    novel_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    row = (
+        await db.execute(
+            text(
+                'SELECT n.id, n.title, n.slug, n."authorName", n."originalTitle", n."originalAuthorName", '
+                'n.description, n."coverUrl", n.status, n."totalChapters", '
+                's.id AS series_id, s.name AS series_name, s.slug AS series_slug '
+                'FROM "Novel" n LEFT JOIN "Series" s ON s.id = n."seriesId" WHERE n.id = :id LIMIT 1'
+            ),
+            {"id": novel_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    genre_rows = (
+        await db.execute(
+            text('SELECT g.id, g.name, g.slug FROM "NovelGenre" ng JOIN "Genre" g ON g.id = ng."genreId" WHERE ng."novelId" = :id ORDER BY g.name ASC'),
+            {"id": novel_id},
+        )
+    ).mappings().all()
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "slug": row["slug"],
+        "authorName": row.get("authorName") or "",
+        "originalTitle": row.get("originalTitle") or "",
+        "originalAuthorName": row.get("originalAuthorName") or "",
+        "description": row.get("description") or "",
+        "coverUrl": row.get("coverUrl"),
+        "status": row.get("status") or "Đang ra",
+        "totalChapters": int(row.get("totalChapters") or 0),
+        "series": (
+            {"id": row["series_id"], "name": row["series_name"], "slug": row["series_slug"]}
+            if row.get("series_id")
+            else None
+        ),
+        "genres": [dict(g) for g in genre_rows],
+    }
+
+
+@app.post("/api/mod/truyen")
+async def mod_create_novel(
+    payload: ModNovelPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    title = " ".join((payload.title or "").split()).strip()
+    author_name = " ".join((payload.authorName or "").split()).strip()
+    if not title or not author_name:
+        raise HTTPException(status_code=400, detail="title và authorName là bắt buộc")
+
+    slug_base = _norm_title(title).replace(" ", "-")[:120] or _new_id("n_")
+    slug = await _ensure_unique_slug(db, table="Novel", slug=slug_base)
+    resolved_series_id = await _resolve_series_id(db, series_id=payload.seriesId, series_name=payload.seriesName)
+
+    novel_id = _new_id("n_")
+    row = (
+        await db.execute(
+            text(
+                'INSERT INTO "Novel" (id, title, slug, "authorName", "originalTitle", "originalAuthorName", description, "coverUrl", status, "seriesId", "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") '
+                'VALUES (:id,:title,:slug,:author,:original_title,:original_author,:description,:cover_url,:status,:series_id,0,0,0,0,0,NOW(),NOW()) '
+                'RETURNING id, title, slug, "authorName", status, "totalChapters", "coverUrl"'
+            ),
+            {
+                "id": novel_id,
+                "title": title,
+                "slug": slug,
+                "author": author_name,
+                "original_title": (payload.originalTitle or "").strip() or None,
+                "original_author": (payload.originalAuthorName or "").strip() or None,
+                "description": (payload.description or "").strip(),
+                "cover_url": (payload.coverUrl or "").strip() or None,
+                "status": (payload.status or "Đang ra").strip() or "Đang ra",
+                "series_id": resolved_series_id,
+            },
+        )
+    ).mappings().first()
+    await _set_novel_genres(db, novel_id, payload.genreIds or [])
+    await db.commit()
+    return dict(row) if row else {}
+
+
+@app.put("/api/mod/truyen")
+async def mod_update_novel(
+    payload: ModNovelPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    novel_id = str(payload.id or "").strip()
+    if not novel_id:
+        raise HTTPException(status_code=400, detail="id là bắt buộc")
+
+    current = (
+        await db.execute(text('SELECT id, title, slug, "seriesId" FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})
+    ).mappings().first()
+    if not current:
+        raise HTTPException(status_code=404, detail="Novel not found")
+
+    next_title = " ".join((payload.title or str(current.get("title") or "")).split()).strip()
+    next_author = " ".join((payload.authorName or "").split()).strip()
+    if not next_title:
+        raise HTTPException(status_code=400, detail="title không hợp lệ")
+    if payload.authorName is not None and not next_author:
+        raise HTTPException(status_code=400, detail="authorName không hợp lệ")
+
+    slug_base = _norm_title(next_title).replace(" ", "-")[:120] or str(current.get("slug") or _new_id("n_"))
+    next_slug = await _ensure_unique_slug(db, table="Novel", slug=slug_base, current_id=novel_id)
+
+    use_series_name = payload.seriesName is not None and str(payload.seriesName).strip() != ""
+    if use_series_name:
+        next_series_id = await _resolve_series_id(db, series_id=None, series_name=payload.seriesName)
+    elif payload.seriesId is not None:
+        next_series_id = await _resolve_series_id(db, series_id=payload.seriesId, series_name=None)
+    else:
+        next_series_id = current.get("seriesId")
+
+    row = (
+        await db.execute(
+            text(
+                'UPDATE "Novel" SET '
+                'title = :title, slug = :slug, '
+                '"authorName" = COALESCE(:author_name, "authorName"), '
+                '"originalTitle" = :original_title, "originalAuthorName" = :original_author, '
+                'description = :description, "coverUrl" = :cover_url, '
+                'status = COALESCE(:status, status), "seriesId" = :series_id, "updatedAt" = NOW() '
+                'WHERE id = :id '
+                'RETURNING id, title, slug, "authorName", status, "totalChapters", "coverUrl"'
+            ),
+            {
+                "id": novel_id,
+                "title": next_title,
+                "slug": next_slug,
+                "author_name": next_author or None,
+                "original_title": (payload.originalTitle or "").strip() or None,
+                "original_author": (payload.originalAuthorName or "").strip() or None,
+                "description": (payload.description or "").strip(),
+                "cover_url": (payload.coverUrl or "").strip() or None,
+                "status": (payload.status or "").strip() or None,
+                "series_id": next_series_id,
+            },
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    if payload.genreIds is not None:
+        await _set_novel_genres(db, novel_id, payload.genreIds)
+    await db.commit()
+    return dict(row)
+
+
+@app.delete("/api/mod/truyen")
+async def mod_delete_novel(
+    id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    deleted = await _delete_novel_by_id(db, id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    await db.commit()
+    return {"id": id, "deleted": True}
+
+
+@app.post("/api/mod/truyen/bulk")
+async def mod_bulk_novel_action(
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    action = str(payload.get("action") or "delete").strip().lower() or "delete"
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list):
+        raw_ids = payload.get("novelIds")
+    ids = [str(i).strip() for i in (raw_ids or []) if str(i).strip()]
+    if action != "delete":
+        raise HTTPException(status_code=400, detail="Unsupported bulk action")
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids is required")
+    deleted_count = 0
+    for novel_id in ids:
+        if await _delete_novel_by_id(db, novel_id):
+            deleted_count += 1
+    await db.commit()
+    return {"action": action, "deletedCount": deleted_count}
+
+
+@app.get("/api/mod/truyen/missing")
+async def mod_list_missing_novels(
+    missing: str = "author,cover,description,genres",
+    q: str = "",
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    keys = {k.strip() for k in missing.split(",") if k.strip()}
+    filters: list[str] = []
+    if "author" in keys:
+        filters.append('(COALESCE(TRIM(n."authorName"), \'\') = \'\')')
+    if "cover" in keys:
+        filters.append('(COALESCE(TRIM(n."coverUrl"), \'\') = \'\')')
+    if "description" in keys:
+        filters.append('(COALESCE(TRIM(n.description), \'\') = \'\')')
+    if "genres" in keys:
+        filters.append('(NOT EXISTS (SELECT 1 FROM "NovelGenre" ng2 WHERE ng2."novelId" = n.id))')
+
+    where_parts: list[str] = []
+    params: dict[str, Any] = {}
+    if filters:
+        where_parts.append(f"({' OR '.join(filters)})")
+    if q.strip():
+        params["q"] = f"%{q.strip()}%"
+        where_parts.append('(n.title ILIKE :q OR n.slug ILIKE :q OR n."authorName" ILIKE :q OR s.name ILIKE :q)')
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    rows = (
+        await db.execute(
+            text(
+                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", n.description, n."totalChapters", n."updatedAt", '
+                's.id AS series_id, s.name AS series_name, s.slug AS series_slug '
+                'FROM "Novel" n LEFT JOIN "Series" s ON s.id = n."seriesId" '
+                f'{where_sql} '
+                'ORDER BY n."updatedAt" DESC, n.title ASC LIMIT 2000'
+            ),
+            params,
+        )
+    ).mappings().all()
+
+    novel_ids = [str(r["id"]) for r in rows]
+    genre_map: dict[str, list[dict[str, Any]]] = {nid: [] for nid in novel_ids}
+    if novel_ids:
+        genre_rows = (
+            await db.execute(
+                text('SELECT ng."novelId", g.id, g.name, g.slug FROM "NovelGenre" ng JOIN "Genre" g ON g.id = ng."genreId" WHERE ng."novelId" = ANY(:novel_ids) ORDER BY g.name ASC'),
+                {"novel_ids": novel_ids},
+            )
+        ).mappings().all()
+        for g in genre_rows:
+            genre_map[str(g["novelId"])].append({"id": g["id"], "name": g["name"], "slug": g["slug"]})
+
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        genres = genre_map.get(str(r["id"]), [])
+        author_blank = not str(r.get("authorName") or "").strip()
+        cover_blank = not str(r.get("coverUrl") or "").strip()
+        desc_blank = not str(r.get("description") or "").strip()
+        genre_blank = len(genres) == 0
+        items.append(
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "slug": r["slug"],
+                "authorName": r.get("authorName") or "",
+                "coverUrl": r.get("coverUrl"),
+                "description": r.get("description") or "",
+                "totalChapters": int(r.get("totalChapters") or 0),
+                "updatedAt": _iso(r.get("updatedAt")),
+                "series": (
+                    {"id": r["series_id"], "name": r["series_name"], "slug": r["series_slug"]}
+                    if r.get("series_id")
+                    else None
+                ),
+                "genres": genres,
+                "missing": {
+                    "author": author_blank,
+                    "cover": cover_blank,
+                    "description": desc_blank,
+                    "genres": genre_blank,
+                },
+            }
+        )
+
+    return {"items": items}
+
+
+@app.patch("/api/mod/truyen/missing")
+async def mod_patch_missing_novels(
+    payload: ModNovelMissingBulkPatchPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    updated_count = 0
+    failures: list[dict[str, Any]] = []
+
+    for item in payload.updates:
+        novel_id = str(item.id or "").strip()
+        if not novel_id:
+            failures.append({"id": item.id, "error": "id không hợp lệ"})
+            continue
+        try:
+            exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})).mappings().first()
+            if not exists:
+                failures.append({"id": novel_id, "error": "Novel not found"})
+                continue
+
+            await db.execute(
+                text(
+                    'UPDATE "Novel" SET '
+                    '"authorName" = COALESCE(:author_name, "authorName"), '
+                    '"coverUrl" = COALESCE(:cover_url, "coverUrl"), '
+                    'description = COALESCE(:description, description), '
+                    '"updatedAt" = NOW() '
+                    'WHERE id = :id'
+                ),
+                {
+                    "id": novel_id,
+                    "author_name": (item.authorName or "").strip() or None,
+                    "cover_url": (item.coverUrl or "").strip() or None,
+                    "description": (item.description or "").strip() or None,
+                },
+            )
+            if item.genreIds is not None:
+                await _set_novel_genres(db, novel_id, item.genreIds)
+            updated_count += 1
+        except Exception as exc:
+            failures.append({"id": novel_id, "error": str(exc)})
+
+    await db.commit()
+    return {
+        "updatedCount": updated_count,
+        "failureCount": len(failures),
+        "failures": failures,
+    }
+
+
+@app.get("/api/mod/overview")
+async def mod_overview(
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    novel_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Novel"'))).scalar_one()
+    total_views = (await db.execute(text('SELECT COALESCE(SUM(views),0)::int FROM "Novel"'))).scalar_one()
+    comment_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Comment"'))).scalar_one()
+    series_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Series"'))).scalar_one()
+    return {
+        "novelCount": int(novel_count or 0),
+        "totalViews": int(total_views or 0),
+        "commentCount": int(comment_count or 0),
+        "seriesCount": int(series_count or 0),
+    }
+
+
+async def _ensure_editor_recommendation_table(db: AsyncSession) -> None:
+    await db.execute(
+        text(
+            'CREATE TABLE IF NOT EXISTS "EditorRecommendationDoc" ('
+            'id TEXT PRIMARY KEY, '
+            '"editorId" TEXT NOT NULL, '
+            '"novelId" TEXT NOT NULL, '
+            'content TEXT, '
+            '"createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()'
+            ')'
+        )
+    )
+    await db.execute(
+        text('CREATE INDEX IF NOT EXISTS "EditorRecommendationDoc_novel_idx" ON "EditorRecommendationDoc"("novelId")')
+    )
+    await db.commit()
+
+
+@app.get("/api/mod/de-cu")
+async def mod_list_recommendations(
+    q: str = "",
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await _ensure_editor_recommendation_table(db)
+
+    docs = (
+        await db.execute(
+            text('SELECT id, "editorId", "novelId", "createdAt" FROM "EditorRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 5000')
+        )
+    ).mappings().all()
+    novel_ids = list({str(d.get("novelId") or "") for d in docs if d.get("novelId")})
+    editor_ids = list({str(d.get("editorId") or "") for d in docs if d.get("editorId")})
+
+    novel_map: dict[str, dict[str, Any]] = {}
+    if novel_ids:
+        rows = (
+            await db.execute(
+                text('SELECT id, title, slug, "authorName", "coverUrl", status, "totalChapters" FROM "Novel" WHERE id = ANY(:ids)'),
+                {"ids": novel_ids},
+            )
+        ).mappings().all()
+        novel_map = {str(r["id"]): dict(r) for r in rows}
+
+    editor_map: dict[str, str] = {}
+    if editor_ids:
+        rows = (
+            await db.execute(
+                text('SELECT id, name FROM "User" WHERE id = ANY(:ids)'),
+                {"ids": editor_ids},
+            )
+        ).mappings().all()
+        editor_map = {str(r["id"]): str(r.get("name") or "Biên tập viên") for r in rows}
+
+    rec_count_map: dict[str, int] = {}
+    for d in docs:
+        nid = str(d.get("novelId") or "")
+        if not nid:
+            continue
+        rec_count_map[nid] = rec_count_map.get(nid, 0) + 1
+
+    items: list[dict[str, Any]] = []
+    for d in docs:
+        nid = str(d.get("novelId") or "")
+        if nid not in novel_map:
+            continue
+        eid = str(d.get("editorId") or "")
+        items.append(
+            {
+                "id": str(d.get("id")),
+                "createdAt": _iso(d.get("createdAt")),
+                "recommendCount": int(rec_count_map.get(nid, 0)),
+                "novel": novel_map[nid],
+                "editor": {"id": eid, "name": editor_map.get(eid, "Biên tập viên")},
+            }
+        )
+
+    summary = [
+        {"novel": novel_map[nid], "recommendCount": int(count)}
+        for nid, count in rec_count_map.items()
+        if nid in novel_map
+    ]
+    summary.sort(key=lambda x: (-int(x["recommendCount"]), str(x["novel"].get("title") or "")))
+
+    params: dict[str, Any] = {}
+    where_sql = ""
+    if q.strip():
+        params["q"] = f"%{q.strip()}%"
+        where_sql = 'WHERE title ILIKE :q OR slug ILIKE :q OR "authorName" ILIKE :q'
+    candidates_rows = (
+        await db.execute(
+            text(
+                f'SELECT id, title, slug, "authorName", "coverUrl", status, "totalChapters" FROM "Novel" '
+                f'{where_sql} ORDER BY "updatedAt" DESC LIMIT 100'
+            ),
+            params,
+        )
+    ).mappings().all()
+    my_editor_id = str(user.get("id") or "")
+    my_novel_ids = {str(d.get("novelId") or "") for d in docs if str(d.get("editorId") or "") == my_editor_id}
+    candidates = []
+    for r in candidates_rows:
+        nid = str(r["id"])
+        candidates.append(
+            {
+                **dict(r),
+                "alreadyRecommended": nid in my_novel_ids,
+                "recommendCount": int(rec_count_map.get(nid, 0)),
+            }
+        )
+
+    my_count = sum(1 for d in docs if str(d.get("editorId") or "") == my_editor_id)
+    return {
+        "items": items,
+        "summary": summary,
+        "candidates": candidates,
+        "myNovelIds": list(my_novel_ids),
+        "currentUser": {
+            "id": my_editor_id,
+            "role": str(user.get("role") or "USER"),
+            "recommendationCount": my_count,
+            "maxRecommendationCount": 5,
+        },
+    }
+
+
+@app.post("/api/mod/de-cu")
+async def mod_create_recommendation(
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await _ensure_editor_recommendation_table(db)
+    novel_id = str(payload.get("novelId") or "").strip()
+    if not novel_id:
+        raise HTTPException(status_code=400, detail="novelId is required")
+    novel_exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})).mappings().first()
+    if not novel_exists:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    editor_id = str(user.get("id") or "")
+    existing = (
+        await db.execute(
+            text('SELECT id FROM "EditorRecommendationDoc" WHERE "editorId" = :editor_id AND "novelId" = :novel_id LIMIT 1'),
+            {"editor_id": editor_id, "novel_id": novel_id},
+        )
+    ).mappings().first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Bạn đã đề cử truyện này")
+    my_count = (
+        await db.execute(
+            text('SELECT COUNT(*)::int FROM "EditorRecommendationDoc" WHERE "editorId" = :editor_id'),
+            {"editor_id": editor_id},
+        )
+    ).scalar_one()
+    if str(user.get("role") or "") != "ADMIN" and int(my_count or 0) >= 5:
+        raise HTTPException(status_code=400, detail="Đã đạt giới hạn đề cử")
+    rec_id = _new_id("erec_")
+    await db.execute(
+        text('INSERT INTO "EditorRecommendationDoc" (id, "editorId", "novelId", "createdAt") VALUES (:id,:editor_id,:novel_id,NOW())'),
+        {"id": rec_id, "editor_id": editor_id, "novel_id": novel_id},
+    )
+    await db.commit()
+    return {"id": rec_id, "novelId": novel_id}
+
+
+@app.delete("/api/mod/de-cu")
+async def mod_delete_recommendation(
+    id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await _ensure_editor_recommendation_table(db)
+    row = (
+        await db.execute(
+            text('SELECT id, "editorId" FROM "EditorRecommendationDoc" WHERE id = :id LIMIT 1'),
+            {"id": id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    is_admin = str(user.get("role") or "") == "ADMIN"
+    if not is_admin and str(row.get("editorId") or "") != str(user.get("id") or ""):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.execute(text('DELETE FROM "EditorRecommendationDoc" WHERE id = :id'), {"id": id})
+    await db.commit()
+    return {"id": id, "deleted": True}
+
+
+async def _upsert_chapter_content(chapter_id: str, novel_id: str, number: int, content: str, db: AsyncSession) -> None:
+    txt_href = f"novel-{novel_id}/{number}.txt"
+    raw_href = f"novel-{novel_id}/{number}.raw.html"
+    txt = str(content or "")
+    await asyncio.to_thread(storage.write_text, txt_href, txt)
+    await asyncio.to_thread(storage.write_text, raw_href, txt)
+    h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+    await db.execute(
+        text(
+            'INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") '
+            'VALUES (:id,:txt,:raw,:hash) '
+            'ON CONFLICT ("chapterId") DO UPDATE SET "txtHref"=EXCLUDED."txtHref", "rawHtmlHref"=EXCLUDED."rawHtmlHref", "contentHash"=EXCLUDED."contentHash", "updatedAt"=NOW()'
+        ),
+        {"id": chapter_id, "txt": txt_href, "raw": raw_href, "hash": h},
+    )
+
+
+@app.get("/api/mod/chuong")
+async def mod_list_chapters(
+    novelId: str,
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    skip = (page - 1) * limit
+    rows = (
+        await db.execute(
+            text('SELECT id, number, title, views, "createdAt" FROM "ChapterMeta" WHERE "novelId" = :novel_id ORDER BY number ASC OFFSET :skip LIMIT :limit'),
+            {"novel_id": novelId, "skip": skip, "limit": limit},
+        )
+    ).mappings().all()
+    total = (await db.execute(text('SELECT COUNT(*)::int FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novelId})).scalar_one()
+    return {
+        "chapters": [
+            {
+                "id": r["id"],
+                "_id": r["id"],
+                "number": int(r.get("number") or 0),
+                "title": r.get("title") or "",
+                "views": int(r.get("views") or 0),
+                "createdAt": _iso(r.get("createdAt")),
+                "volumeNumber": None,
+                "volumeTitle": None,
+                "volumeChapterNumber": None,
+            }
+            for r in rows
+        ],
+        "totalChapters": int(total or 0),
+        "totalPages": (int(total or 0) + limit - 1) // limit if total else 0,
+        "currentPage": page,
+    }
+
+
+@app.get("/api/mod/chuong/{chapter_id}")
+async def mod_get_chapter_detail(
+    chapter_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    row = (
+        await db.execute(
+            text('SELECT id, "novelId", number, title, views, "createdAt" FROM "ChapterMeta" WHERE id = :id LIMIT 1'),
+            {"id": chapter_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    content = await _resolve_chapter_content(chapter_id, db) or ""
+    return {
+        "id": row["id"],
+        "_id": row["id"],
+        "novelId": row["novelId"],
+        "number": int(row.get("number") or 0),
+        "title": row.get("title") or "",
+        "content": content,
+        "views": int(row.get("views") or 0),
+        "createdAt": _iso(row.get("createdAt")),
+        "volumeNumber": None,
+        "volumeTitle": None,
+        "volumeChapterNumber": None,
+    }
+
+
+@app.post("/api/mod/chuong")
+async def mod_create_chapter(
+    payload: ModChapterPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    novel_exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": payload.novelId})).mappings().first()
+    if not novel_exists:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    existing = (
+        await db.execute(
+            text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
+            {"novel_id": payload.novelId, "number": payload.number},
+        )
+    ).mappings().first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Chapter number already exists")
+    cid = _new_id("cmeta_")
+    await db.execute(
+        text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'),
+        {"id": cid, "novel": payload.novelId, "num": payload.number, "title": payload.title.strip()},
+    )
+    await _upsert_chapter_content(cid, payload.novelId, payload.number, payload.content, db)
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": payload.novelId})
+    await db.commit()
+    return {"id": cid, "created": True}
+
+
+@app.put("/api/mod/chuong")
+async def mod_update_chapter(
+    payload: ModChapterPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    chapter_id = str(payload.id or "").strip()
+    if not chapter_id:
+        raise HTTPException(status_code=400, detail="id is required")
+    row = (
+        await db.execute(
+            text('SELECT id, "novelId" FROM "ChapterMeta" WHERE id = :id LIMIT 1'),
+            {"id": chapter_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    await db.execute(
+        text('UPDATE "ChapterMeta" SET number = :num, title = :title WHERE id = :id'),
+        {"id": chapter_id, "num": payload.number, "title": payload.title.strip()},
+    )
+    await _upsert_chapter_content(chapter_id, str(row["novelId"]), payload.number, payload.content, db)
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": row["novelId"]})
+    await db.commit()
+    return {"id": chapter_id, "updated": True}
+
+
+@app.delete("/api/mod/chuong")
+async def mod_delete_chapter(
+    id: str,
+    novelId: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" = :id'), {"id": id})
+    row = (
+        await db.execute(
+            text('DELETE FROM "ChapterMeta" WHERE id = :id AND "novelId" = :novel_id RETURNING id'),
+            {"id": id, "novel_id": novelId},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": novelId})
+    await db.commit()
+    return {"id": id, "deleted": True}
+
+
+@app.post("/api/mod/chuong/bulk-delete")
+async def mod_bulk_delete_chapters(
+    payload: ModChapterBulkDeletePayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    from_num = min(payload.fromNumber, payload.toNumber)
+    to_num = max(payload.fromNumber, payload.toNumber)
+    ids = (
+        await db.execute(
+            text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number BETWEEN :from_num AND :to_num'),
+            {"novel_id": payload.novelId, "from_num": from_num, "to_num": to_num},
+        )
+    ).mappings().all()
+    chapter_ids = [str(r["id"]) for r in ids]
+    if chapter_ids:
+        await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" = ANY(:ids)'), {"ids": chapter_ids})
+    deleted_count = (
+        await db.execute(
+            text('DELETE FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number BETWEEN :from_num AND :to_num RETURNING id'),
+            {"novel_id": payload.novelId, "from_num": from_num, "to_num": to_num},
+        )
+    ).mappings().all()
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": payload.novelId})
+    await db.commit()
+    return {"deletedCount": len(deleted_count)}
+
+
+@app.put("/api/mod/chuong/optimize")
+async def mod_optimize_chapters(
+    payload: ModChapterOptimizePayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    modified = 0
+    for item in payload.updates:
+        row = (
+            await db.execute(
+                text('SELECT id FROM "ChapterMeta" WHERE id = :id AND "novelId" = :novel_id LIMIT 1'),
+                {"id": item.id, "novel_id": payload.novelId},
+            )
+        ).mappings().first()
+        if not row:
+            continue
+        await db.execute(
+            text('UPDATE "ChapterMeta" SET number = :number, title = :title WHERE id = :id'),
+            {"id": item.id, "number": item.number, "title": item.title},
+        )
+        modified += 1
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": payload.novelId})
+    await db.commit()
+    return {"modifiedCount": modified}
+
+
+@app.post("/api/mod/chuong/global-replace")
+async def mod_global_replace_chapters(
+    payload: ModChapterGlobalReplacePayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    rows = (
+        await db.execute(
+            text('SELECT id, number, title FROM "ChapterMeta" WHERE "novelId" = :novel_id ORDER BY number ASC'),
+            {"novel_id": payload.novelId},
+        )
+    ).mappings().all()
+    flags = 0 if payload.matchCase else re.IGNORECASE
+    previews: list[dict[str, Any]] = []
+    updated = 0
+    for r in rows:
+        cid = str(r["id"])
+        content = await _resolve_chapter_content(cid, db) or ""
+        new_content = content
+        if payload.action == "replace":
+            find_text = str(payload.findText or "")
+            if not find_text:
+                continue
+            pattern = re.compile(re.escape(find_text), flags)
+            new_content = pattern.sub(str(payload.replaceText or ""), content)
+        elif payload.action == "trash":
+            for tw in payload.trashWords:
+                if not str(tw).strip():
+                    continue
+                pattern = re.compile(re.escape(str(tw)), flags)
+                new_content = pattern.sub("", new_content)
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported action")
+
+        if new_content == content:
+            continue
+        if payload.preview:
+            previews.append(
+                {
+                    "chapterId": cid,
+                    "number": int(r.get("number") or 0),
+                    "title": str(r.get("title") or ""),
+                    "snippet": new_content[:240],
+                }
+            )
+            if len(previews) >= 50:
+                break
+        else:
+            await _upsert_chapter_content(cid, payload.novelId, int(r.get("number") or 0), new_content, db)
+            updated += 1
+    if payload.preview:
+        return {"previews": previews}
+    await db.commit()
+    return {"updatedChapters": updated}
+
+
+@app.get("/api/mod/truyen/{novel_id}/trash-words")
+async def mod_get_trash_words(
+    novel_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    row = (
+        await db.execute(text('SELECT "trashWords" FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    return {"trashWords": list(row.get("trashWords") or [])}
+
+
+@app.put("/api/mod/truyen/{novel_id}/trash-words")
+async def mod_set_trash_words(
+    novel_id: str,
+    payload: ModNovelTrashWordsPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    clean = [str(w).strip() for w in payload.trashWords if str(w).strip()]
+    row = (
+        await db.execute(
+            text('UPDATE "Novel" SET "trashWords" = :words, "updatedAt" = NOW() WHERE id = :id RETURNING id'),
+            {"id": novel_id, "words": clean},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    await db.commit()
+    return {"novelId": novel_id, "trashWords": clean}
+
+
+@app.post("/api/mod/upload-cover")
+async def mod_upload_cover(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    ext = ".jpg"
+    ct = (file.content_type or "").lower()
+    if "png" in ct:
+        ext = ".png"
+    elif "webp" in ct:
+        ext = ".webp"
+    elif "jpeg" in ct or "jpg" in ct:
+        ext = ".jpg"
+    url = _upload_cover_bytes_to_r2(content, ext, key_prefix=f"mod-cover-{_new_id()}")
+    if not url:
+        raise HTTPException(status_code=500, detail="Upload failed")
+    return {"url": url}
+
+
+@app.post("/api/mod/epub")
+async def mod_epub_upload(
+    file: UploadFile = File(...),
+    preview: str | None = Form(default=None),
+    splitMode: str | None = Form(default=None),
+    chapterRegex: str | None = Form(default=None),
+    title: str | None = Form(default=None),
+    authorName: str | None = Form(default=None),
+    description: str | None = Form(default=None),
+    seriesMode: str | None = Form(default=None),
+    seriesId: str | None = Form(default=None),
+    seriesName: str | None = Form(default=None),
+    replaceExisting: str | None = Form(default=None),
+    appendTargetNovelId: str | None = Form(default=None),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty EPUB")
+
+    suffix = ".epub"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(raw)
+        tmp_path = Path(tmp.name)
+
+    try:
+        mode = "regex" if (splitMode or "").lower() == "regex" else "toc"
+        pattern = (chapterRegex or "").strip() or None
+        chapters = _epub_extract_with_mode(tmp_path, mode, pattern)
+        base_title = " ".join((title or Path(file.filename or "novel").stem).split()).strip() or "Untitled"
+        base_author = " ".join((authorName or "Unknown").split()).strip() or "Unknown"
+        base_desc = (description or "").strip()
+        has_cover = bool(_extract_epub_cover(tmp_path))
+
+        if str(preview or "").lower() == "true":
+            return {
+                "preview": True,
+                "fileName": file.filename or "upload.epub",
+                "splitMode": mode,
+                "detectedStructureType": "standard",
+                "hasCoverFromEpub": has_cover,
+                "parserInfo": {
+                    "splitMode": mode,
+                    "chapterRegexUsed": pattern,
+                    "sourceSections": len(chapters),
+                    "chaptersDetected": len(chapters),
+                    "chaptersFinal": len(chapters),
+                    "insertedMissingChapters": len([c for c in chapters if c.get("is_placeholder")]),
+                    "detectedMaxChapterNumber": max([int(c.get("number") or 0) for c in chapters], default=0),
+                    "detectedNumberAssignments": len([c for c in chapters if int(c.get("number") or 0) > 0]),
+                },
+                "novel": {
+                    "title": base_title,
+                    "authorName": base_author,
+                    "description": base_desc,
+                    "detectedGenres": [],
+                    "totalChapters": len(chapters),
+                },
+                "chaptersPreview": [
+                    {
+                        "number": int(c.get("number") or 0),
+                        "title": str(c.get("title") or ""),
+                        "isPlaceholder": bool(c.get("is_placeholder") or False),
+                        "volumeNumber": None,
+                        "volumeTitle": None,
+                        "volumeChapterNumber": None,
+                        "excerpt": str(c.get("txt") or "")[:200],
+                    }
+                    for c in chapters[:30]
+                ],
+            }
+
+        target_novel_id = str(appendTargetNovelId or "").strip()
+        if target_novel_id:
+            exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": target_novel_id})).mappings().first()
+            if not exists:
+                raise HTTPException(status_code=404, detail="Target novel not found")
+            added = 0
+            replaced = 0
+            for ch in chapters:
+                num = int(ch.get("number") or 0)
+                if num <= 0:
+                    continue
+                existing_ch = (
+                    await db.execute(
+                        text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :num LIMIT 1'),
+                        {"novel_id": target_novel_id, "num": num},
+                    )
+                ).mappings().first()
+                if existing_ch:
+                    await db.execute(text('UPDATE "ChapterMeta" SET title = :title WHERE id = :id'), {"id": existing_ch["id"], "title": str(ch.get("title") or f"Chapter {num}")})
+                    if not bool(ch.get("is_placeholder") or False):
+                        await _upsert_chapter_content(str(existing_ch["id"]), target_novel_id, num, str(ch.get("txt") or ""), db)
+                    replaced += 1
+                else:
+                    cid = _new_id("cmeta_")
+                    await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": target_novel_id, "num": num, "title": str(ch.get("title") or f"Chapter {num}")})
+                    if not bool(ch.get("is_placeholder") or False):
+                        await _upsert_chapter_content(cid, target_novel_id, num, str(ch.get("txt") or ""), db)
+                    added += 1
+            await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": target_novel_id})
+            await db.commit()
+            return {
+                "novelId": target_novel_id,
+                "parserInfo": {"chaptersFinal": len(chapters)},
+                "added": added,
+                "replaced": replaced,
+            }
+
+        existing_by_title = (
+            await db.execute(
+                text('SELECT id, title, slug FROM "Novel" WHERE lower(title) = :title LIMIT 1'),
+                {"title": base_title.lower()},
+            )
+        ).mappings().first()
+        should_replace = str(replaceExisting or "").lower() in {"1", "true", "yes", "on"}
+        if existing_by_title and not should_replace:
+            return Response(
+                content=json.dumps(
+                    {
+                        "code": "DUPLICATE_TITLE",
+                        "error": "Truyện đã tồn tại",
+                        "canReplace": True,
+                        "existingNovel": {
+                            "id": existing_by_title["id"],
+                            "title": existing_by_title["title"],
+                            "slug": existing_by_title["slug"],
+                        },
+                    }
+                ),
+                status_code=409,
+                media_type="application/json",
+            )
+
+        target_series_id: str | None = None
+        sm = str(seriesMode or "none").lower()
+        if sm == "existing":
+            target_series_id = await _resolve_series_id(db, series_id=seriesId, series_name=None)
+        elif sm == "new":
+            target_series_id = await _resolve_series_id(db, series_id=None, series_name=seriesName)
+
+        if existing_by_title and should_replace:
+            novel_id = str(existing_by_title["id"])
+            await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" IN (SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id)'), {"novel_id": novel_id})
+            await db.execute(text('DELETE FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
+            await db.execute(
+                text('UPDATE "Novel" SET "authorName" = :author, description = :desc, "coverUrl" = COALESCE("coverUrl", :cover), "seriesId" = :series_id, "updatedAt" = NOW() WHERE id = :id'),
+                {
+                    "id": novel_id,
+                    "author": base_author,
+                    "desc": base_desc,
+                    "cover": None,
+                    "series_id": target_series_id,
+                },
+            )
+        else:
+            novel_id = _new_id("n_")
+            slug = await _ensure_unique_slug(db, table="Novel", slug=_norm_title(base_title).replace(" ", "-")[:120] or novel_id)
+            await db.execute(
+                text('INSERT INTO "Novel" (id, title, slug, "authorName", description, "coverUrl", status, "seriesId", "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:desc,:cover,:status,:series_id,0,0,0,0,0,NOW(),NOW())'),
+                {
+                    "id": novel_id,
+                    "title": base_title,
+                    "slug": slug,
+                    "author": base_author,
+                    "desc": base_desc,
+                    "cover": None,
+                    "status": "Đang ra",
+                    "series_id": target_series_id,
+                },
+            )
+
+        for ch in chapters:
+            num = int(ch.get("number") or 0)
+            if num <= 0:
+                continue
+            cid = _new_id("cmeta_")
+            await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": novel_id, "num": num, "title": str(ch.get("title") or f"Chapter {num}")})
+            if not bool(ch.get("is_placeholder") or False):
+                await _upsert_chapter_content(cid, novel_id, num, str(ch.get("txt") or ""), db)
+
+        await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": novel_id})
+        await db.commit()
+        return {
+            "novelId": novel_id,
+            "replaced": bool(existing_by_title and should_replace),
+            "totalChapters": len(chapters),
+            "parserInfo": {"chaptersFinal": len(chapters)},
+        }
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@app.get("/api/truyen")
+async def get_novel_by_query(
+    slug: str,
+    db: AsyncSession = Depends(get_db_session),
+):
+    row = (
+        await db.execute(
+            text('SELECT id, title, slug, "authorName", "coverUrl", status, "totalChapters" FROM "Novel" WHERE id = :slug OR slug = :slug LIMIT 1'),
+            {"slug": slug},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Novel not found")
     return dict(row)
 
 
@@ -993,7 +2631,7 @@ async def get_novel_chapters(
     chapters = (
         await db.execute(
             text(
-                'SELECT id, number, title, views, "volumeNumber", "volumeTitle", "volumeChapterNumber", "createdAt" '
+                'SELECT id, number, title, views, "createdAt" '
                 'FROM "ChapterMeta" WHERE "novelId" = :novel_id ORDER BY number ASC OFFSET :skip LIMIT :limit'
             ),
             {"novel_id": novel_id, "skip": skip, "limit": limit},
@@ -1010,9 +2648,6 @@ async def get_novel_chapters(
                 "number": item.get("number"),
                 "title": item.get("title"),
                 "views": item.get("views", 0),
-                "volumeNumber": item.get("volumeNumber"),
-                "volumeTitle": item.get("volumeTitle"),
-                "volumeChapterNumber": item.get("volumeChapterNumber"),
                 "createdAt": _iso(item.get("createdAt")),
             }
             for item in chapters
@@ -1028,7 +2663,7 @@ async def get_chapter_by_number(novel_id: str, chapter_number: int, db: AsyncSes
     chapter = (
         await db.execute(
             text(
-                'SELECT id, "novelId", number, title, views, "volumeNumber", "volumeTitle", "volumeChapterNumber", "createdAt" '
+                'SELECT id, "novelId", number, title, views, "createdAt" '
                 'FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'
             ),
             {"novel_id": novel_id, "number": chapter_number},
@@ -1057,7 +2692,7 @@ async def get_chapter_by_number(novel_id: str, chapter_number: int, db: AsyncSes
     await db.commit()
 
     chapter_id = str(chapter.get("id"))
-    content = await _resolve_chapter_content(chapter_id, None, db)
+    content = await _resolve_chapter_content(chapter_id, db)
 
     return {
         "id": str(chapter.get("id")),
@@ -1066,9 +2701,6 @@ async def get_chapter_by_number(novel_id: str, chapter_number: int, db: AsyncSes
         "title": chapter.get("title"),
         "content": content,
         "views": int(chapter.get("views") or 0) + 1,
-        "volumeNumber": chapter.get("volumeNumber"),
-        "volumeTitle": chapter.get("volumeTitle"),
-        "volumeChapterNumber": chapter.get("volumeChapterNumber"),
         "createdAt": _iso(chapter.get("createdAt")),
         "prevChapterNumber": prev_chapter.get("number") if prev_chapter else None,
         "nextChapterNumber": next_chapter.get("number") if next_chapter else None,
@@ -1081,7 +2713,7 @@ async def get_chapter_detail(chapter_id: str, db: AsyncSession = Depends(get_db_
     chapter = (
         await db.execute(
             text(
-                'SELECT id, "novelId", number, title, views, "volumeNumber", "volumeTitle", "volumeChapterNumber", "createdAt" '
+                'SELECT id, "novelId", number, title, views, "createdAt" '
                 'FROM "ChapterMeta" WHERE id = :id LIMIT 1'
             ),
             {"id": chapter_id},
@@ -1103,7 +2735,7 @@ async def get_chapter_detail(chapter_id: str, db: AsyncSession = Depends(get_db_
         )
     ).mappings().first()
 
-    content = await _resolve_chapter_content(chapter_id, None, db)
+    content = await _resolve_chapter_content(chapter_id, db)
 
     return {
         "id": str(chapter.get("id")),
@@ -1112,9 +2744,6 @@ async def get_chapter_detail(chapter_id: str, db: AsyncSession = Depends(get_db_
         "title": chapter.get("title"),
         "content": content,
         "views": chapter.get("views", 0),
-        "volumeNumber": chapter.get("volumeNumber"),
-        "volumeTitle": chapter.get("volumeTitle"),
-        "volumeChapterNumber": chapter.get("volumeChapterNumber"),
         "createdAt": _iso(chapter.get("createdAt")),
         "prevChapterId": str(prev_chapter.get("id")) if prev_chapter else None,
         "prevChapterNumber": prev_chapter.get("number") if prev_chapter else None,
@@ -1164,6 +2793,18 @@ class RatePayload(BaseModel):
     score: float = Field(ge=1, le=5)
 
 
+class ModGenrePayload(BaseModel):
+    id: str | None = None
+    name: str
+    description: str | None = None
+    icon: str | None = None
+
+
+class ModGenreMergePayload(BaseModel):
+    sourceId: str
+    targetId: str
+
+
 class SourceAssetApprovePayload(BaseModel):
     status: str = Field(pattern="^(approved|rejected|review_required)$")
 
@@ -1188,12 +2829,141 @@ class ImportJobCompletePayload(BaseModel):
     force: bool = False
 
 
+class ImportApplyPayload(BaseModel):
+    novelId: str
+    replaceMode: str = "none"  # none | selected | range
+    selectedChapterNumbers: list[int] = []
+    rangeStart: int | None = None
+    rangeEnd: int | None = None
+
+
 class SourceAssetUpsertPayload(BaseModel):
     path: str
     sha256: str
     opfIdentifier: str | None = None
     title: str | None = None
     author: str | None = None
+
+
+class SourceAssetReviewPayload(BaseModel):
+    title: str | None = None
+    author: str | None = None
+    shortDescription: str | None = None
+    genres: list[str] = []
+    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
+    chapterStartPattern: str | None = None
+    targetMode: str = Field(default="new", pattern="^(new|existing)$")
+    novelId: str | None = None
+    replaceExisting: bool = False
+
+
+class SourceAssetParsePreviewPayload(BaseModel):
+    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
+    chapterStartPattern: str | None = None
+
+
+class SourceAssetStartImportPayload(BaseModel):
+    replaceExisting: bool = False
+    forceNovelId: str | None = None
+    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
+    chapterStartPattern: str | None = None
+
+
+class SourceAssetAiSuggestPayload(BaseModel):
+    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
+    chapterStartPattern: str | None = None
+
+
+class ModSeriesPayload(BaseModel):
+    id: str | None = None
+    name: str
+    description: str | None = None
+
+
+class ModNovelPayload(BaseModel):
+    id: str | None = None
+    title: str | None = None
+    originalTitle: str | None = None
+    authorName: str | None = None
+    originalAuthorName: str | None = None
+    description: str | None = None
+    coverUrl: str | None = None
+    status: str | None = None
+    genreIds: list[str] | None = None
+    seriesId: str | None = None
+    seriesName: str | None = None
+
+
+class ModNovelBulkPayload(BaseModel):
+    action: str
+    ids: list[str]
+
+
+class ModNovelMissingUpdatePayload(BaseModel):
+    id: str
+    authorName: str | None = None
+    coverUrl: str | None = None
+    description: str | None = None
+    genreIds: list[str] | None = None
+
+
+class ModNovelMissingBulkPatchPayload(BaseModel):
+    updates: list[ModNovelMissingUpdatePayload]
+
+
+class ModChapterPayload(BaseModel):
+    id: str | None = None
+    novelId: str
+    number: int
+    title: str
+    content: str
+    volumeNumber: int | None = None
+    volumeTitle: str | None = None
+    volumeChapterNumber: int | None = None
+
+
+class ModChapterBulkDeletePayload(BaseModel):
+    novelId: str
+    fromNumber: int
+    toNumber: int
+
+
+class ModChapterOptimizeItem(BaseModel):
+    id: str
+    title: str
+    number: int
+
+
+class ModChapterOptimizePayload(BaseModel):
+    novelId: str
+    updates: list[ModChapterOptimizeItem]
+
+
+class ModChapterGlobalReplacePayload(BaseModel):
+    novelId: str
+    action: str
+    findText: str | None = None
+    replaceText: str | None = None
+    trashWords: list[str] = []
+    matchCase: bool = False
+    preview: bool = False
+
+
+class ModNovelTrashWordsPayload(BaseModel):
+    trashWords: list[str] = []
+
+
+def _norm_title(v: str) -> str:
+    s = (v or "").strip().lower()
+    frm = "áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ"
+    to = "aaaaaaaaaaaaaaaaaeeeeeeeeeeeiiiiiooooooooooooooooouuuuuuuuuuuyyyyyd"
+    s = s.translate(str.maketrans(frm, to))
+    s = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
+    return " ".join(s.split())
+
+
+def _title_score(a: str, b: str) -> float:
+    return SequenceMatcher(None, _norm_title(a), _norm_title(b)).ratio()
 
 
 def _asset_file_sha256(path: Path) -> str:
@@ -1207,6 +2977,89 @@ def _asset_file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def _derive_chapter_title(txt: str, fallback: str, number: int) -> str:
+    lines = [line.strip().lstrip("#").strip() for line in txt.splitlines() if line.strip()]
+    chapter_re = re.compile(r"^(?:chuong|ch\.?|chapter|hoi|quyen|phan|tap)\s*\d+(?:[\.:\-\)]\s*|\s+).+", re.IGNORECASE)
+    chapter_num_re = re.compile(r"^(?:chuong|ch\.?|chapter|hoi|quyen|phan|tap)\s*\d+", re.IGNORECASE)
+
+    for line in lines[:12]:
+        normalized = _norm_title(line)
+        if not normalized:
+            continue
+        if chapter_re.match(normalized):
+            return line
+        if chapter_num_re.match(normalized):
+            return line
+
+    if lines:
+        first = lines[0]
+        if len(first) <= 160 and len(first.split()) >= 3:
+            # Prefer human-readable first heading over EPUB internal filename.
+            if "/" in fallback or fallback.lower().endswith(".xhtml"):
+                return first
+            return first
+
+    if fallback and "/" not in fallback and not fallback.lower().endswith(".xhtml"):
+        return fallback
+    return f"Chương {number}"
+
+
+def _extract_title_chapter_number(title: str) -> int | None:
+    normalized = _norm_title(title or "")
+    if not normalized:
+        return None
+    m = re.search(r"(?:chuong|ch\.?|chapter|hoi|quyen|phan|tap)\s*(\d+)", normalized, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        number = int(m.group(1))
+        return number if number > 0 else None
+    except Exception:
+        return None
+
+
+def _normalize_chapter_sequence(chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not chapters:
+        return []
+
+    normalized_items: list[dict[str, Any]] = []
+    prev_number = 0
+    for idx, ch in enumerate(chapters, start=1):
+        detected_number = _extract_title_chapter_number(str(ch.get("title") or ""))
+        if detected_number is None:
+            mapped_number = prev_number + 1 if prev_number > 0 else idx
+        else:
+            mapped_number = detected_number if detected_number > prev_number else (prev_number + 1)
+
+        txt = str(ch.get("txt") or "").strip()
+        raw_html = str(ch.get("raw_html") or "").strip()
+        title = str(ch.get("title") or f"Chương {mapped_number}").strip()
+
+        for missing in range(prev_number + 1, mapped_number):
+            normalized_items.append(
+                {
+                    "number": missing,
+                    "title": f"Chương {missing}",
+                    "raw_html": "",
+                    "txt": "",
+                    "is_placeholder": True,
+                }
+            )
+
+        normalized_items.append(
+            {
+                "number": mapped_number,
+                "title": title,
+                "raw_html": raw_html,
+                "txt": txt,
+                "is_placeholder": False,
+            }
+        )
+        prev_number = mapped_number
+
+    return normalized_items
+
+
 def _extract_epub_chapters(epub_path: Path) -> list[dict[str, Any]]:
     from app.epub_parser import build_chapters_from_epub
 
@@ -1217,18 +3070,505 @@ def _extract_epub_chapters(epub_path: Path) -> list[dict[str, Any]]:
         content = str(ch.get("content") or "")
         if not content.strip():
             continue
+        txt = str(ch.get("txt") or "").strip()
+        title = _derive_chapter_title(txt, str(ch.get("title") or f"Chapter {idx}"), idx)
         chapters.append(
             {
                 "number": int(ch.get("number") or idx),
-                "title": str(ch.get("title") or f"Chapter {idx}"),
+                "title": title,
                 "raw_html": content,
-                "txt": str(ch.get("txt") or "").strip(),
+                "txt": txt,
             }
         )
     return chapters
 
 
-async def _resolve_chapter_content(chapter_id: str, mongo_fallback: str | None, db: AsyncSession) -> str | None:
+def _is_toc_or_intro(chapter: dict[str, Any]) -> bool:
+    title = _norm_title(str(chapter.get("title") or ""))
+    txt = _norm_title(str(chapter.get("txt") or "")[:500])
+    combined = f"{title} {txt}".strip()
+    if not combined:
+        return True
+
+    if any(token in combined for token in ["muc luc", "table of contents", "contents", " nav xhtml", "toc"]):
+        return True
+
+    title_intro_markers = ["gioi thieu", "mo dau", "loi mo dau", "tom tat", "description", "synopsis", "preface"]
+    if any(token in title for token in title_intro_markers):
+        return True
+
+    chapter_like = re.search(r"\b(chuong|chapter|hoi|quyen|phan|tap|chuong\s*\d+|chapter\s*\d+)\b", combined)
+    if chapter_like:
+        return False
+
+    intro_markers = ["gioi thieu", "mo dau", "loi mo dau", "tom tat", "mo ta", "description", "synopsis", "preface"]
+    if any(token in combined for token in intro_markers):
+        return True
+
+    # Very short non-chapter sections are likely front/back matter.
+    if len(str(chapter.get("txt") or "").strip()) < 300:
+        return True
+
+    return False
+
+
+def _filter_toc_chapters(chapters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not chapters:
+        return []
+
+    filtered = [ch for ch in chapters if not _is_toc_or_intro(ch)]
+    if not filtered:
+        # fallback: only drop obvious TOC files to avoid empty result
+        filtered = [
+            ch for ch in chapters
+            if "muc luc" not in _norm_title(str(ch.get("txt") or "")[:500])
+            and "table of contents" not in _norm_title(str(ch.get("txt") or "")[:500])
+        ]
+
+    out: list[dict[str, Any]] = []
+    for idx, ch in enumerate(filtered, start=1):
+        out.append({
+            "number": idx,
+            "title": str(ch.get("title") or f"Chapter {idx}"),
+            "raw_html": str(ch.get("raw_html") or ""),
+            "txt": str(ch.get("txt") or ""),
+        })
+    return out
+
+
+def _extract_epub_chapters_by_regex(epub_path: Path, chapter_start_pattern: str) -> list[dict[str, Any]]:
+    chapters = _extract_epub_chapters(epub_path)
+    pattern = chapter_start_pattern.strip()
+    if not pattern:
+        return chapters
+    re_compiled = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+
+    merged: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for ch in chapters:
+        title = str(ch.get("title") or "")
+        txt = str(ch.get("txt") or "")
+        raw_html = str(ch.get("raw_html") or "")
+        starts = bool(re_compiled.search(title)) or bool(re_compiled.search(txt))
+        if starts:
+            if current:
+                merged.append(current)
+            current = {
+                "number": len(merged) + 1,
+                "title": title or f"Chapter {len(merged) + 1}",
+                "txt": txt,
+                "raw_html": raw_html,
+            }
+        else:
+            if current is None:
+                # Ignore front/back matter before first real chapter match.
+                continue
+            current["txt"] = f"{current['txt']}\n\n{txt}".strip()
+            current["raw_html"] = f"{current['raw_html']}\n{raw_html}".strip()
+    if current:
+        merged.append(current)
+    return merged if merged else chapters
+
+
+def _chapter_preview_samples(chapters: list[dict[str, Any]], sample_size: int = 10) -> list[dict[str, Any]]:
+    if not chapters:
+        return []
+
+    head = chapters[:sample_size]
+    if len(chapters) <= sample_size * 2:
+        middle = chapters[sample_size:]
+        tail = []
+    else:
+        mid_start = max((len(chapters) // 2) - (sample_size // 2), sample_size)
+        middle = chapters[mid_start:mid_start + sample_size]
+        tail = chapters[-sample_size:]
+
+    seen: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for group, label in [(head, "head"), (middle, "middle"), (tail, "tail")]:
+        for ch in group:
+            number = int(ch.get("number") or 0)
+            if number in seen:
+                continue
+            seen.add(number)
+            txt = str(ch.get("txt") or "")
+            out.append(
+                {
+                    "bucket": label,
+                    "number": number,
+                    "title": str(ch.get("title") or ""),
+                    "chars": len(txt),
+                    "preview": txt[:280] if txt else ("(placeholder - no content)" if ch.get("is_placeholder") else ""),
+                    "isPlaceholder": bool(ch.get("is_placeholder") or False),
+                }
+            )
+    return out
+
+
+def _epub_extract_with_mode(epub_path: Path, split_mode: str, chapter_start_pattern: str | None) -> list[dict[str, Any]]:
+    if split_mode == "regex":
+        default_vi_regex = r"^\s*(?:[#>*\-\[]\s*)*(?:ch(?:u\.?|ương|uong)?|chapter|hồi|hoi|quyển|quyen|phần|phan|tập|tap)\s*\d+(?:[\.:\-\)]\s*|\s+).+$"
+        effective_pattern = chapter_start_pattern or default_vi_regex
+        try:
+            return _normalize_chapter_sequence(_extract_epub_chapters_by_regex(epub_path, effective_pattern))
+        except re.error as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid chapterStartPattern: {exc}") from exc
+    return _normalize_chapter_sequence(_filter_toc_chapters(_extract_epub_chapters(epub_path)))
+
+
+async def _ensure_genre_ids(db: AsyncSession, names: list[str]) -> list[str]:
+    out: list[str] = []
+    for raw_name in names:
+        name = " ".join((raw_name or "").split()).strip()
+        if not name:
+            continue
+        slug = _norm_title(name).replace(" ", "-")[:120] or _new_id("genre_")
+        existing = (
+            await db.execute(
+                text('SELECT id FROM "Genre" WHERE lower(name) = :name OR slug = :slug LIMIT 1'),
+                {"name": name.lower(), "slug": slug},
+            )
+        ).mappings().first()
+        if existing:
+            out.append(str(existing["id"]))
+            continue
+        gid = _new_id("genre_")
+        await db.execute(
+            text('INSERT INTO "Genre" (id, name, slug, description, icon) VALUES (:id, :name, :slug, NULL, NULL)'),
+            {"id": gid, "name": name, "slug": slug},
+        )
+        out.append(gid)
+    return out
+
+
+def _ensure_genre_ids_sync(db: Any, names: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_name in names:
+        name = " ".join((raw_name or "").split()).strip()
+        if not name:
+            continue
+        slug = _norm_title(name).replace(" ", "-")[:120] or _new_id("genre_")
+        if slug in seen:
+            continue
+        seen.add(slug)
+        existing = db.execute(
+            text('SELECT id FROM "Genre" WHERE lower(name) = :name OR slug = :slug LIMIT 1'),
+            {"name": name.lower(), "slug": slug},
+        ).mappings().first()
+        if existing:
+            out.append(str(existing["id"]))
+            continue
+        gid = _new_id("genre_")
+        db.execute(
+            text('INSERT INTO "Genre" (id, name, slug, description, icon) VALUES (:id, :name, :slug, NULL, NULL)'),
+            {"id": gid, "name": name, "slug": slug},
+        )
+        out.append(gid)
+    return out
+
+
+def _build_ai_genre_suggestions(chapters: list[dict[str, Any]]) -> list[str]:
+    hay = " ".join([str(ch.get("title") or "") + " " + str(ch.get("txt") or "")[:800] for ch in chapters[:8]]).lower()
+    mapping = [
+        ("tiên hiệp", ["tu tiên", "linh khí", "đan điền", "nguyên anh"]),
+        ("kiếm hiệp", ["kiếm", "giang hồ", "môn phái", "võ công"]),
+        ("đô thị", ["thành phố", "công ty", "tổng tài", "đô thị"]),
+        ("hệ thống", ["hệ thống", "nhiệm vụ", "kỹ năng", "điểm thưởng"]),
+        ("huyền huyễn", ["ma pháp", "huyền", "long", "thần"]),
+        ("xuyên không", ["xuyên", "trùng sinh", "trở về", "quá khứ"]),
+        ("ngôn tình", ["tình yêu", "hôn", "nam chính", "nữ chính"]),
+        ("trinh thám", ["vụ án", "hung thủ", "điều tra", "manh mối"]),
+    ]
+    picked: list[str] = []
+    for genre, keys in mapping:
+        if any(k in hay for k in keys):
+            picked.append(genre)
+        if len(picked) >= 6:
+            break
+    if not picked:
+        picked = ["tiểu thuyết"]
+    return picked[:6]
+
+
+def _build_ai_description(title: str, author: str | None, chapters: list[dict[str, Any]]) -> str:
+    first = (str(chapters[0].get("txt") or "")[:180] if chapters else "").strip()
+    author_text = author or "Tác giả chưa rõ"
+    if first:
+        return f"{title} của {author_text} mở ra câu chuyện với nhịp đọc cuốn hút, tập trung vào hành trình nhân vật chính và các bước ngoặt liên tiếp. Bối cảnh được triển khai rõ nét, phù hợp cho độc giả thích theo dõi mạch truyện dài hơi."
+    return f"{title} là tác phẩm của {author_text}, có nhịp truyện rõ ràng và dễ theo dõi theo từng chương. Nội dung phù hợp để đọc liên tục với mạch phát triển ổn định."
+
+
+def _extract_epub_cover(epub_path: Path) -> tuple[bytes, str] | None:
+    from ebooklib import ITEM_COVER, ITEM_IMAGE
+    from ebooklib import epub as epublib
+
+    try:
+        book = epublib.read_epub(str(epub_path), options={"ignore_ncx": False})
+    except Exception:
+        return None
+
+    for item in book.get_items():
+        try:
+            media_type = str(getattr(item, "media_type", "") or "")
+            name = str(getattr(item, "file_name", "") or getattr(item, "get_name", lambda: "")() or "").lower()
+            item_type = item.get_type() if hasattr(item, "get_type") else None
+
+            is_image = media_type.startswith("image/") or item_type == ITEM_IMAGE
+            is_cover = item_type == ITEM_COVER or "cover" in name
+            if not is_image:
+                continue
+
+            data = item.get_content() if hasattr(item, "get_content") else b""
+            if not data:
+                continue
+
+            # Prefer explicit cover first, otherwise fallback to first image.
+            if is_cover or not name:
+                ext = ".jpg"
+                if media_type == "image/png":
+                    ext = ".png"
+                elif media_type == "image/webp":
+                    ext = ".webp"
+                return data, ext
+        except Exception:
+            continue
+
+    # Fallback: first image in book package.
+    for item in book.get_items():
+        try:
+            media_type = str(getattr(item, "media_type", "") or "")
+            if not media_type.startswith("image/"):
+                continue
+            data = item.get_content() if hasattr(item, "get_content") else b""
+            if not data:
+                continue
+            ext = ".jpg"
+            if media_type == "image/png":
+                ext = ".png"
+            elif media_type == "image/webp":
+                ext = ".webp"
+            return data, ext
+        except Exception:
+            continue
+    return None
+
+
+def _upload_cover_bytes_to_r2(image_bytes: bytes, extension: str, *, key_prefix: str) -> str | None:
+    if not image_bytes:
+        return None
+    if (
+        not settings.r2_account_id
+        or not settings.r2_access_key_id
+        or not settings.r2_secret_access_key
+        or not settings.r2_bucket_name
+    ):
+        return None
+
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=f"https://{settings.r2_account_id}.r2.cloudflarestorage.com",
+            aws_access_key_id=settings.r2_access_key_id,
+            aws_secret_access_key=settings.r2_secret_access_key,
+            region_name="auto",
+        )
+        key = f"covers/{key_prefix}-{int(time.time() * 1000)}{extension}"
+        content_type = "image/jpeg"
+        if extension == ".png":
+            content_type = "image/png"
+        elif extension == ".webp":
+            content_type = "image/webp"
+
+        s3.put_object(
+            Bucket=settings.r2_bucket_name,
+            Key=key,
+            Body=image_bytes,
+            ContentType=content_type,
+            CacheControl="public, max-age=31536000, immutable",
+        )
+
+        base = (settings.r2_public_base_url or "").rstrip("/")
+        if base:
+            return f"{base}/{key}"
+        return key
+    except Exception:
+        return None
+
+
+def _upload_cover_to_r2(image_bytes: bytes, extension: str, *, source_asset_id: str) -> str | None:
+    return _upload_cover_bytes_to_r2(
+        image_bytes,
+        extension,
+        key_prefix=f"import-cover-{source_asset_id}",
+    )
+
+
+def _r2_key_from_cover_url(cover_url: str | None) -> str | None:
+    raw = str(cover_url or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("covers/"):
+        return raw
+    base = (settings.r2_public_base_url or "").rstrip("/")
+    if base and raw.startswith(base + "/"):
+        key = raw[len(base) + 1 :]
+        return key or None
+    return None
+
+
+def _delete_r2_key(key: str | None) -> bool:
+    target = str(key or "").strip()
+    if not target:
+        return False
+    if (
+        not settings.r2_account_id
+        or not settings.r2_access_key_id
+        or not settings.r2_secret_access_key
+        or not settings.r2_bucket_name
+    ):
+        return False
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=f"https://{settings.r2_account_id}.r2.cloudflarestorage.com",
+            aws_access_key_id=settings.r2_access_key_id,
+            aws_secret_access_key=settings.r2_secret_access_key,
+            region_name="auto",
+        )
+        s3.delete_object(Bucket=settings.r2_bucket_name, Key=target)
+        return True
+    except Exception:
+        return False
+
+
+def _map_genres_to_existing(candidates: list[str], existing_genres: list[str], *, limit: int = 6) -> list[str]:
+    existing_clean = [g.strip() for g in existing_genres if g and g.strip()]
+    existing_norm = [(_norm_title(g), g) for g in existing_clean]
+
+    output: list[str] = []
+    used_norm: set[str] = set()
+    for raw in candidates:
+        name = (raw or "").strip()
+        if not name:
+            continue
+        cand_norm = _norm_title(name)
+        if not cand_norm:
+            continue
+
+        best_name = name
+        best_score = 0.0
+        for ex_norm, ex_name in existing_norm:
+            if cand_norm == ex_norm:
+                best_name = ex_name
+                best_score = 1.0
+                break
+            score = SequenceMatcher(None, cand_norm, ex_norm).ratio()
+            if score > best_score:
+                best_score = score
+                best_name = ex_name
+
+        # Snap to existing genre when similarity is strong.
+        final_name = best_name if best_score >= 0.86 else name
+        final_norm = _norm_title(final_name)
+        if final_norm in used_norm:
+            continue
+        used_norm.add(final_norm)
+        output.append(final_name)
+        if len(output) >= limit:
+            break
+
+    return output
+
+
+async def _deepseek_ai_suggest(
+    title: str,
+    author: str,
+    chapters: list[dict[str, Any]],
+    existing_genres: list[str],
+) -> dict[str, Any] | None:
+    api_key = (settings.deepseek_key or "").strip()
+    if not api_key:
+        return None
+
+    samples: list[str] = []
+    if chapters:
+        picks = [chapters[0]]
+        if len(chapters) > 2:
+            picks.append(chapters[len(chapters) // 2])
+        if len(chapters) > 1:
+            picks.append(chapters[-1])
+        for ch in picks:
+            snippet = str(ch.get("txt") or "")[:1200]
+            samples.append(f"Chapter {ch.get('number')}: {ch.get('title')}\n{snippet}")
+
+    system_prompt = (
+        "You are a Vietnamese fiction metadata assistant. "
+        "Return strict JSON with keys: genres, shortDescription, confidence. "
+        "genres must be array of 1-6 concise genre strings. "
+        "Prioritize selecting from existingGenres first; only create new genres when truly needed. "
+        "shortDescription must be 2-4 Vietnamese sentences. "
+        "confidence is number 0..1."
+    )
+    user_prompt = {
+        "title": title,
+        "author": author,
+        "chapterSamples": samples,
+        "existingGenres": existing_genres,
+        "requirements": {
+            "maxGenres": 6,
+            "allowNewGenres": True,
+            "preferExistingGenres": True,
+            "language": "vi",
+        },
+    }
+
+    payload = {
+        "model": settings.deepseek_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 500,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+        response.raise_for_status()
+        data = response.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        parsed = json.loads(content) if isinstance(content, str) else {}
+        raw_genres = [str(g).strip() for g in (parsed.get("genres") or []) if str(g).strip()][:6]
+        genres = _map_genres_to_existing(raw_genres, existing_genres, limit=6)
+        short_description = str(parsed.get("shortDescription") or "").strip()
+        try:
+            confidence = float(parsed.get("confidence") or 0.0)
+        except Exception:
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+        if not short_description or not genres:
+            return None
+        return {
+            "suggestedGenres": genres,
+            "shortDescription": short_description,
+            "confidence": confidence,
+        }
+    except Exception:
+        return None
+
+
+async def _resolve_chapter_content(chapter_id: str, db: AsyncSession) -> str | None:
     ref_row = (
         await db.execute(
             text('SELECT "txtHref" FROM "ChapterContentRef" WHERE "chapterId" = :chapter_id LIMIT 1'),
@@ -1236,22 +3576,12 @@ async def _resolve_chapter_content(chapter_id: str, mongo_fallback: str | None, 
         )
     ).mappings().first()
 
-    if settings.chapter_content_mode == "mongo_first":
-        if mongo_fallback:
-            return mongo_fallback
-        if ref_row:
-            try:
-                return storage.read_text(ref_row["txtHref"])
-            except Exception:
-                return mongo_fallback
-        return mongo_fallback
-
     if ref_row:
         try:
             return storage.read_text(ref_row["txtHref"])
         except Exception:
-            return mongo_fallback
-    return mongo_fallback
+            return None
+    return None
 
 
 @app.get("/api/import/assets")
@@ -1293,7 +3623,686 @@ async def list_source_assets(
             {**params, "offset": offset},
         )
     ).mappings().all()
-    return [dict(r) for r in rows]
+    novels = (await db.execute(text('SELECT id, title FROM "Novel"'))).mappings().all()
+    out: list[dict[str, Any]] = []
+    normalized_query = _norm_title(q or "")
+    query_tokens = [t for t in normalized_query.split(" ") if t]
+    for r in rows:
+        item = dict(r)
+        base = (item.get("path") or "").split("/")[-1].rsplit(".", 1)[0]
+        normalized_path = _norm_title(str(item.get("path") or ""))
+        if query_tokens and not all(tok in normalized_path for tok in query_tokens):
+            continue
+        best = {"id": None, "score": 0.0}
+        for n in novels:
+            sc = _title_score(base, str(n.get("title") or ""))
+            if sc > best["score"]:
+                best = {"id": n.get("id"), "score": sc}
+        item["matchedNovelId"] = best["id"]
+        item["matchScore"] = round(best["score"], 4)
+        item["converted"] = best["score"] >= 0.9
+        if unconvertedOnly and item["converted"]:
+            continue
+        out.append(item)
+    return out
+
+
+@app.get("/api/import/assets/search")
+async def search_source_assets(
+    q: str,
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=20, ge=1, le=100),
+    status: str | None = None,
+    db: AsyncSession = Depends(get_db_session),
+):
+    query = _normalized_search_name(q)
+    if len(query) < 2:
+        return {"items": [], "pagination": {"page": page, "limit": limit, "total": 0, "totalPages": 0}}
+
+    where = ['search_name IS NOT NULL']
+    params: dict[str, Any] = {
+        "q_prefix": f"{query}%",
+        "q_like": f"%{query}%",
+        "offset": (page - 1) * limit,
+        "limit": limit,
+    }
+    if status:
+        where.append('status = :status')
+        params["status"] = status
+
+    where_sql = " AND ".join(where)
+    total = (
+        await db.execute(
+            text(f'SELECT COUNT(*)::int FROM "SourceAsset" WHERE {where_sql} AND (search_name LIKE :q_prefix OR search_name ILIKE :q_like)'),
+            params,
+        )
+    ).scalar_one()
+    rows = (
+        await db.execute(
+            text(
+                f'SELECT id, path, title, author, status, "updatedAt" '
+                f'FROM "SourceAsset" '
+                f'WHERE {where_sql} AND (search_name LIKE :q_prefix OR search_name ILIKE :q_like) '
+                f'ORDER BY CASE WHEN search_name LIKE :q_prefix THEN 0 ELSE 1 END, "updatedAt" DESC '
+                f'OFFSET :offset LIMIT :limit'
+            ),
+            params,
+        )
+    ).mappings().all()
+
+    total_pages = max((total + limit - 1) // limit, 1) if total else 0
+    return {
+        "items": [dict(row) for row in rows],
+        "pagination": {"page": page, "limit": limit, "total": int(total), "totalPages": total_pages},
+    }
+
+
+@app.get("/api/import/assets/{asset_id}/preview-metadata")
+async def preview_source_asset_metadata(
+    asset_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    row = (
+        await db.execute(
+            text(
+                'SELECT id, path, title, author, status, review_status, review_payload, sha256, "updatedAt" '
+                'FROM "SourceAsset" WHERE id = :id LIMIT 1'
+            ),
+            {"id": asset_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    path = str(row["path"])
+    base = path.split("/")[-1].rsplit(".", 1)[0]
+    source_path = Path(settings.epub_source_root) / path
+    cover_detected = bool(_extract_epub_cover(source_path)) if source_path.exists() else False
+    return {
+        "asset": {**dict(row), "coverDetected": cover_detected},
+        "suggested": {
+            "title": row.get("title") or base,
+            "author": row.get("author") or "Unknown",
+            "shortDescription": None,
+            "genres": [],
+        },
+    }
+
+
+@app.get("/api/import/assets/{asset_id}/preview-cover")
+async def preview_source_asset_cover(
+    asset_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    row = (
+        await db.execute(text('SELECT id, path FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    source_path = Path(settings.epub_source_root) / str(row["path"])
+    if not source_path.exists():
+        raise HTTPException(status_code=400, detail="EPUB source file not found")
+    cover = _extract_epub_cover(source_path)
+    if not cover:
+        raise HTTPException(status_code=404, detail="Cover not found in EPUB")
+    cover_bytes, ext = cover
+    media_type = "image/jpeg"
+    if ext == ".png":
+        media_type = "image/png"
+    elif ext == ".webp":
+        media_type = "image/webp"
+    return Response(content=cover_bytes, media_type=media_type)
+
+
+@app.post("/api/import/assets/{asset_id}/upload-cover")
+async def upload_source_asset_cover(
+    asset_id: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = (
+        await db.execute(text('SELECT id, review_payload FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="File cover rong")
+    ext = ".jpg"
+    ct = (file.content_type or "").lower()
+    if "png" in ct:
+        ext = ".png"
+    elif "webp" in ct:
+        ext = ".webp"
+    elif "jpeg" in ct or "jpg" in ct:
+        ext = ".jpg"
+
+    cover_url = _upload_cover_bytes_to_r2(content, ext, key_prefix=f"manual-cover-{asset_id}")
+    if not cover_url:
+        raise HTTPException(status_code=500, detail="Upload cover that bai")
+
+    review_payload = row.get("review_payload") or {}
+    if isinstance(review_payload, str):
+        try:
+            review_payload = json.loads(review_payload)
+        except Exception:
+            review_payload = {}
+    review_payload["manualCoverUrl"] = cover_url
+
+    await db.execute(
+        text('UPDATE "SourceAsset" SET review_payload = CAST(:review_payload AS jsonb), "updatedAt" = NOW() WHERE id = :id'),
+        {"id": asset_id, "review_payload": json.dumps(review_payload)},
+    )
+    await db.commit()
+
+    return {"assetId": asset_id, "coverUrl": cover_url, "uploaded": True}
+
+
+@app.post("/api/import/assets/{asset_id}/review")
+async def review_source_asset(
+    asset_id: str,
+    payload: SourceAssetReviewPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if payload.targetMode == "existing" and not payload.novelId:
+        raise HTTPException(status_code=400, detail="novelId is required when targetMode=existing")
+
+    row = (
+        await db.execute(
+            text(
+                'UPDATE "SourceAsset" SET title = COALESCE(:title, title), author = COALESCE(:author, author), '
+                'review_status = :review_status, review_payload = CAST(:review_payload AS jsonb), status = :status, "updatedAt" = NOW() '
+                'WHERE id = :id RETURNING id, path, title, author, status, review_status, review_payload, "updatedAt"'
+            ),
+            {
+                "id": asset_id,
+                "title": payload.title,
+                "author": payload.author,
+                "review_status": "reviewed",
+                "review_payload": json.dumps(payload.model_dump()),
+                "status": "approved",
+            },
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+    await db.commit()
+    return dict(row)
+
+
+@app.post("/api/import/assets/{asset_id}/ai-suggest")
+async def ai_suggest_source_asset(
+    asset_id: str,
+    payload: SourceAssetAiSuggestPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = (
+        await db.execute(text('SELECT id, path, title, author FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    source_path = Path(settings.epub_source_root) / str(row["path"])
+    if not source_path.exists():
+        raise HTTPException(status_code=400, detail="EPUB source file not found")
+
+    chapters = _epub_extract_with_mode(source_path, payload.splitMode, payload.chapterStartPattern)
+    title = str(row.get("title") or source_path.stem)
+    author = str(row.get("author") or "Unknown")
+    existing_genres = [
+        str(r.get("name") or "")
+        for r in (await db.execute(text('SELECT name FROM "Genre" ORDER BY name ASC'))).mappings().all()
+        if str(r.get("name") or "").strip()
+    ]
+
+    ai_result = await _deepseek_ai_suggest(title, author, chapters, existing_genres)
+    if ai_result:
+        return {
+            "assetId": asset_id,
+            "suggestedGenres": ai_result["suggestedGenres"][:6],
+            "shortDescription": ai_result["shortDescription"],
+            "confidence": ai_result["confidence"],
+            "source": "deepseek",
+            "existingGenresCount": len(existing_genres),
+        }
+
+    genres = _build_ai_genre_suggestions(chapters)
+    genres = _map_genres_to_existing(genres, existing_genres, limit=6)
+    description = _build_ai_description(title, author, chapters)
+    return {
+        "assetId": asset_id,
+        "suggestedGenres": genres[:6],
+        "shortDescription": description,
+        "confidence": 0.62,
+        "source": "rule_based_fallback",
+        "existingGenresCount": len(existing_genres),
+    }
+
+
+@app.post("/api/import/assets/{asset_id}/parse-preview")
+async def parse_preview_source_asset(
+    asset_id: str,
+    payload: SourceAssetParsePreviewPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    row = (
+        await db.execute(text('SELECT id, path FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+    source_path = Path(settings.epub_source_root) / str(row["path"])
+    if not source_path.exists():
+        raise HTTPException(status_code=400, detail="EPUB source file not found")
+
+    chapters = _epub_extract_with_mode(source_path, payload.splitMode, payload.chapterStartPattern)
+    return {
+        "assetId": asset_id,
+        "splitMode": payload.splitMode,
+        "chapterCount": len(chapters),
+        "sample": _chapter_preview_samples(chapters, sample_size=10),
+        "warnings": [] if len(chapters) >= 3 else ["chapter_count_too_low"],
+    }
+
+
+def _run_import_session_task(session_id: str) -> None:
+    from app.database import SessionLocal
+
+    async def _run() -> None:
+        db = SessionLocal()
+        try:
+            row = (
+                await db.execute(
+                    text(
+                        'SELECT s.id, s."sourceAssetId", s."novelId", s.status, a.path, a.review_payload, a.title, a.author '
+                        'FROM "ImportSession" s JOIN "SourceAsset" a ON a.id = s."sourceAssetId" WHERE s.id = :id LIMIT 1'
+                    ),
+                    {"id": session_id},
+                )
+            ).mappings().first()
+            if not row:
+                return
+
+            await db.execute(
+                text('UPDATE "ImportSession" SET status = :st, phase = :ph, "progressPct" = :pct, "updatedAt" = NOW() WHERE id = :id'),
+                {"id": session_id, "st": "processing", "ph": "prepare", "pct": 5.0},
+            )
+            await db.commit()
+
+            source_path = Path(settings.epub_source_root) / str(row["path"])
+            if not source_path.exists():
+                await db.execute(
+                    text('UPDATE "ImportSession" SET status = :st, phase = :ph, log = :log, "updatedAt" = NOW() WHERE id = :id'),
+                    {"id": session_id, "st": "failed", "ph": "prepare", "log": "EPUB source file not found"},
+                )
+                await db.commit()
+                return
+
+            review_payload = row.get("review_payload") or {}
+            if isinstance(review_payload, str):
+                try:
+                    review_payload = json.loads(review_payload)
+                except Exception:
+                    review_payload = {}
+
+            cover_url: str | None = str(review_payload.get("manualCoverUrl") or "").strip() or None
+            if not cover_url:
+                cover_extracted = _extract_epub_cover(source_path)
+                if cover_extracted:
+                    cover_bytes, cover_ext = cover_extracted
+                    cover_url = _upload_cover_to_r2(cover_bytes, cover_ext, source_asset_id=str(row["sourceAssetId"]))
+
+            split_mode = str(review_payload.get("splitMode") or "toc")
+            chapter_start_pattern = review_payload.get("chapterStartPattern")
+            target_mode = str(review_payload.get("targetMode") or "new")
+            replace_existing = bool(review_payload.get("replaceExisting") or False)
+
+            await db.execute(
+                text('UPDATE "ImportSession" SET phase = :ph, "progressPct" = :pct, "updatedAt" = NOW() WHERE id = :id'),
+                {"id": session_id, "ph": "parse", "pct": 20.0},
+            )
+            await db.commit()
+            await db.execute(
+                text('UPDATE "ImportSession" SET log = :log, "updatedAt" = NOW() WHERE id = :id'),
+                {"id": session_id, "log": "parsing epub"},
+            )
+            await db.commit()
+            chapters = await asyncio.wait_for(
+                asyncio.to_thread(_epub_extract_with_mode, source_path, split_mode, chapter_start_pattern),
+                timeout=180,
+            )
+
+            novel_id = row.get("novelId")
+            if not novel_id and target_mode == "existing":
+                novel_id = review_payload.get("novelId")
+            if novel_id:
+                novel_exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})).mappings().first()
+                if not novel_exists:
+                    raise RuntimeError("Target novel not found")
+            if not novel_id:
+                base_title = str(review_payload.get("title") or row.get("title") or source_path.stem)
+                slug = _norm_title(base_title).replace(" ", "-")[:120] or _new_id("n_")
+                existing_slug_row = (
+                    await db.execute(text('SELECT id FROM "Novel" WHERE slug = :slug LIMIT 1'), {"slug": slug})
+                ).mappings().first()
+                if existing_slug_row:
+                    slug = f"{slug}-{_new_id()[:8]}"
+                novel_id = _new_id("n_")
+                await db.execute(
+                    text('INSERT INTO "Novel" (id, title, slug, "authorName", description, "coverUrl", status, "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:desc,:cover_url,:status,0,0,0,0,0,NOW(),NOW())'),
+                    {
+                        "id": novel_id,
+                        "title": base_title,
+                        "slug": slug,
+                        "author": str(review_payload.get("author") or row.get("author") or "Unknown"),
+                        "desc": str(review_payload.get("shortDescription") or ""),
+                        "cover_url": cover_url,
+                        "status": "Đang ra",
+                    },
+                )
+            elif cover_url:
+                await db.execute(
+                    text('UPDATE "Novel" SET "coverUrl" = COALESCE("coverUrl", :cover_url), "updatedAt" = NOW() WHERE id = :id'),
+                    {"id": novel_id, "cover_url": cover_url},
+                )
+
+            genres = [str(g) for g in (review_payload.get("genres") or [])]
+            if genres:
+                genre_ids = await _ensure_genre_ids(db, genres)
+                for gid in genre_ids:
+                    await db.execute(
+                        text('INSERT INTO "NovelGenre" ("novelId", "genreId") VALUES (:novel_id, :genre_id) ON CONFLICT DO NOTHING'),
+                        {"novel_id": novel_id, "genre_id": gid},
+                    )
+
+            await db.execute(
+                text('UPDATE "ImportSession" SET phase = :ph, "progressPct" = :pct, "novelId" = :novel_id, "updatedAt" = NOW() WHERE id = :id'),
+                {"id": session_id, "ph": "write_nas", "pct": 50.0, "novel_id": novel_id},
+            )
+            await db.commit()
+
+            added = 0
+            replaced = 0
+            skipped = 0
+            failed = 0
+            last_error: str | None = None
+            asset_id = str(row["sourceAssetId"])
+            total_chapters = max(1, len(chapters))
+            await db.execute(
+                text('UPDATE "ImportSession" SET phase = :ph, log = :log, "updatedAt" = NOW() WHERE id = :id'),
+                {"id": session_id, "ph": "write_nas", "log": f"writing chapters 0/{total_chapters}"},
+            )
+            await db.commit()
+
+            async def _write_storage_text(href: str, content: str) -> None:
+                await asyncio.wait_for(asyncio.to_thread(storage.write_text, href, content), timeout=20)
+
+            for idx, ch in enumerate(chapters, start=1):
+                processed_this = False
+                try:
+                    async with db.begin_nested():
+                        num = int(ch.get("number") or 0)
+                        if num <= 0:
+                            failed += 1
+                            continue
+                        is_placeholder = bool(ch.get("is_placeholder") or False)
+                        existing = (
+                            await db.execute(
+                                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :num LIMIT 1'),
+                                {"novel_id": novel_id, "num": num},
+                            )
+                        ).mappings().first()
+
+                        if existing:
+                            if replace_existing:
+                                await db.execute(text('UPDATE "ChapterMeta" SET title = :title WHERE id = :id'), {"id": existing["id"], "title": str(ch.get("title") or f"Chapter {num}")})
+                                if not is_placeholder:
+                                    txt_href = f"{asset_id}/{num}.txt"
+                                    raw_href = f"{asset_id}/{num}.raw.html"
+                                    txt = str(ch.get("txt") or "")
+                                    await _write_storage_text(txt_href, txt)
+                                    await _write_storage_text(raw_href, str(ch.get("raw_html") or ""))
+                                    h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+                                    await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId","txtHref","rawHtmlHref","contentHash") VALUES (:id,:txt,:raw,:hash) ON CONFLICT ("chapterId") DO UPDATE SET "txtHref"=EXCLUDED."txtHref", "rawHtmlHref"=EXCLUDED."rawHtmlHref", "contentHash"=EXCLUDED."contentHash", "updatedAt"=NOW()'), {"id": existing["id"], "txt": txt_href, "raw": raw_href, "hash": h})
+                                else:
+                                    await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" = :id'), {"id": existing["id"]})
+                                replaced += 1
+                                processed_this = True
+                            else:
+                                skipped += 1
+                                processed_this = True
+                            continue
+
+                        cid = _new_id("cmeta_")
+                        await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": novel_id, "num": num, "title": str(ch.get("title") or f"Chapter {num}")})
+                        if not is_placeholder:
+                            txt_href = f"{asset_id}/{num}.txt"
+                            raw_href = f"{asset_id}/{num}.raw.html"
+                            txt = str(ch.get("txt") or "")
+                            await _write_storage_text(txt_href, txt)
+                            await _write_storage_text(raw_href, str(ch.get("raw_html") or ""))
+                            h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+                            await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId","txtHref","rawHtmlHref","contentHash") VALUES (:id,:txt,:raw,:hash)'), {"id": cid, "txt": txt_href, "raw": raw_href, "hash": h})
+                        added += 1
+                        processed_this = True
+                except Exception as exc:
+                    failed += 1
+                    processed_this = True
+                    if last_error is None:
+                        last_error = str(exc)
+
+                if not processed_this:
+                    skipped += 1
+                    processed_this = True
+
+                if idx % 10 == 0 or idx == total_chapters:
+                    progress = 50.0 + (float(idx) / float(total_chapters)) * 45.0
+                    processed = added + replaced + skipped + failed
+                    await db.execute(
+                        text('UPDATE "ImportSession" SET "progressPct" = :pct, log = :log, "updatedAt" = NOW() WHERE id = :id'),
+                        {"id": session_id, "pct": min(progress, 95.0), "log": f"writing chapters {processed}/{total_chapters}"},
+                    )
+                    await db.commit()
+
+            await db.execute(text('UPDATE "Novel" SET description = COALESCE(:desc, description), "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": novel_id, "desc": review_payload.get("shortDescription")})
+            await db.execute(
+                text('UPDATE "ImportSession" SET status = :st, phase = :ph, "progressPct" = :pct, "resultJson" = CAST(:result AS jsonb), "updatedAt" = NOW() WHERE id = :id'),
+                {
+                    "id": session_id,
+                    "st": "completed",
+                    "ph": "finalize",
+                    "pct": 100.0,
+                    "result": json.dumps({"parsed": len(chapters), "added": added, "replaced": replaced, "skipped": skipped, "failed": failed, "novelId": novel_id, "lastError": last_error}),
+                },
+            )
+            await db.execute(
+                text('UPDATE "SourceAsset" SET status = :status, review_status = :review_status, "updatedAt" = NOW() WHERE id = :id'),
+                {"id": row["sourceAssetId"], "status": "completed" if failed == 0 else "review_required", "review_status": "imported" if failed == 0 else "reviewed"},
+            )
+            await db.commit()
+        except Exception as exc:
+            try:
+                await db.rollback()
+                await db.execute(
+                    text('UPDATE "ImportSession" SET status = :st, log = :log, "updatedAt" = NOW() WHERE id = :id'),
+                    {"id": session_id, "st": "failed", "log": str(exc)},
+                )
+                await db.commit()
+            except Exception:
+                pass
+        finally:
+            await db.close()
+
+    return _run()
+
+
+@app.post("/api/import/assets/{asset_id}/start-import")
+async def start_import_source_asset(
+    asset_id: str,
+    payload: SourceAssetStartImportPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    asset = (
+        await db.execute(text('SELECT id, status, review_payload FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
+    ).mappings().first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    review_payload = asset.get("review_payload") or {}
+    if isinstance(review_payload, str):
+        try:
+            review_payload = json.loads(review_payload)
+        except Exception:
+            review_payload = {}
+    review_payload["replaceExisting"] = bool(payload.replaceExisting)
+    review_payload["splitMode"] = payload.splitMode
+    review_payload["chapterStartPattern"] = payload.chapterStartPattern
+
+    await db.execute(
+        text('UPDATE "SourceAsset" SET review_payload = CAST(:review_payload AS jsonb), "updatedAt" = NOW() WHERE id = :id'),
+        {"id": asset_id, "review_payload": json.dumps(review_payload)},
+    )
+
+    session_id = _new_id("is_")
+    await db.execute(
+        text(
+            'INSERT INTO "ImportSession" (id, "sourceAssetId", "novelId", status, phase, "progressPct", log, "resultJson", "createdBy") '
+            'VALUES (:id, :asset, :novel, :status, :phase, :pct, :log, :result, :created_by)'
+        ),
+        {
+            "id": session_id,
+            "asset": asset_id,
+            "novel": payload.forceNovelId,
+            "status": "pending",
+            "phase": "prepare",
+            "pct": 0.0,
+            "log": None,
+            "result": None,
+            "created_by": str(user.get("id") or ""),
+        },
+    )
+    await db.commit()
+
+    task = asyncio.create_task(_run_import_session_task(session_id), name=f"import-session-{session_id}")
+    _IMPORT_TASKS.add(task)
+    task.add_done_callback(lambda t: _IMPORT_TASKS.discard(t))
+    return {"sessionId": session_id, "status": "pending", "phase": "prepare", "progressPct": 0}
+
+
+@app.get("/api/import/sessions/{session_id}")
+async def get_import_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = (
+        await db.execute(
+            text(
+                'SELECT id, "sourceAssetId", "novelId", status, phase, "progressPct", log, "resultJson", "createdAt", "updatedAt" '
+                'FROM "ImportSession" WHERE id = :id LIMIT 1'
+            ),
+            {"id": session_id},
+        )
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Import session not found")
+    out = dict(row)
+    result = out.get("resultJson")
+    if isinstance(result, str):
+        try:
+            out["resultJson"] = json.loads(result)
+        except Exception:
+            out["resultJson"] = None
+    return out
+
+
+class ConvertAssetPayload(BaseModel):
+    assetId: str
+
+
+@app.post("/api/import/convert")
+async def convert_asset(
+    payload: ConvertAssetPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    asset = (
+        await db.execute(text('SELECT id, path FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": payload.assetId})
+    ).mappings().first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Source asset not found")
+
+    base = str(asset.get("path") or "").split("/")[-1].rsplit(".", 1)[0]
+    novels = (await db.execute(text('SELECT id, title FROM "Novel"'))).mappings().all()
+    best = {"id": None, "score": 0.0}
+    for n in novels:
+        sc = _title_score(base, str(n.get("title") or ""))
+        if sc > best["score"]:
+            best = {"id": n.get("id"), "score": sc}
+    novel_id = best["id"]
+    if not novel_id:
+        novel_id = _new_id("n_")
+        slug = _norm_title(base).replace(" ", "-")[:120] or novel_id
+        await db.execute(
+            text('INSERT INTO "Novel" (id, title, slug, "authorName", description, status, "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:desc,:status,0,0,0,0,0,NOW(),NOW())'),
+            {"id": novel_id, "title": base, "slug": slug, "author": "Unknown", "desc": "", "status": "Đang ra"},
+        )
+
+    source_path = Path(settings.epub_source_root) / str(asset["path"])
+    if not source_path.exists():
+        raise HTTPException(status_code=400, detail="EPUB source file not found")
+    chapters = _extract_epub_chapters(source_path)
+    added = 0
+    for ch in chapters:
+        num = int(ch.get("number") or 0)
+        if num <= 0:
+            continue
+        existing = (await db.execute(text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :num LIMIT 1'), {"novel_id": novel_id, "num": num})).mappings().first()
+        if existing:
+            continue
+        cid = _new_id("c_")
+        txt_href = f"{payload.assetId}/{num}.txt"
+        raw_href = f"{payload.assetId}/{num}.raw.html"
+        txt = str(ch.get("txt") or "")
+        storage.write_text(txt_href, txt)
+        storage.write_text(raw_href, str(ch.get("raw_html") or ""))
+        h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+        await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": novel_id, "num": num, "title": str(ch.get("title") or f"Chapter {num}")})
+        await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId","txtHref","rawHtmlHref","contentHash") VALUES (:id,:txt,:raw,:hash)'), {"id": cid, "txt": txt_href, "raw": raw_href, "hash": h})
+        added += 1
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": novel_id})
+    await db.commit()
+    return {"assetId": payload.assetId, "novelId": novel_id, "added": added, "done": True}
 
 
 @app.post("/api/import/assets/auto-review")
@@ -1411,39 +4420,7 @@ async def discover_epub_assets(
     if user.get("role") not in ("MOD", "ADMIN"):
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    root = Path(settings.epub_source_root)
-    if not root.exists():
-        raise HTTPException(status_code=400, detail=f"EPUB source root not found: {settings.epub_source_root}")
-
-    found = sorted(root.rglob("*.epub"))[:limit]
-    discovered = 0
-    updated = 0
-
-    for epub_path in found:
-        sha256 = _asset_file_sha256(epub_path)
-        rel_path = str(epub_path.relative_to(root))
-        existing = (
-            await db.execute(text('SELECT id FROM "SourceAsset" WHERE sha256 = :sha LIMIT 1'), {"sha": sha256})
-        ).mappings().first()
-
-        if existing:
-            await db.execute(
-                text('UPDATE "SourceAsset" SET path = :path, "updatedAt" = NOW() WHERE id = :id'),
-                {"id": existing["id"], "path": rel_path},
-            )
-            updated += 1
-            continue
-
-        await db.execute(
-            text(
-                'INSERT INTO "SourceAsset" (id, path, sha256, status) VALUES (:id, :path, :sha, :status)'
-            ),
-            {"id": _new_id("asset_"), "path": rel_path, "sha": sha256, "status": "discovered"},
-        )
-        discovered += 1
-
-    await db.commit()
-    return {"scanned": len(found), "discovered": discovered, "updated": updated}
+    return await _discover_assets_incremental(limit=limit)
 
 
 @app.post("/api/import/assets/{asset_id}/approve")
@@ -1640,6 +4617,98 @@ async def run_import_job(
         )
         await db.commit()
         raise HTTPException(status_code=500, detail="Import job failed") from exc
+
+
+@app.post("/api/import/jobs/{job_id}/preview")
+async def preview_import_job(
+    job_id: str,
+    payload: ImportApplyPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    job = (await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})).mappings().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Import job not found")
+    asset_id = str(job["sourceAssetId"])
+    asset_dir = Path(settings.nas_content_root) / asset_id
+    if not asset_dir.exists():
+        raise HTTPException(status_code=400, detail="Converted content folder not found")
+
+    await db.execute(text('DELETE FROM "ImportCandidateChapter" WHERE "jobId" = :job_id'), {"job_id": job_id})
+    created = 0
+    for txt_file in sorted(asset_dir.glob("*.txt")):
+        token = txt_file.stem
+        if not token.isdigit():
+            continue
+        num = int(token)
+        title = txt_file.with_suffix(".raw.html").name
+        chapter = (await db.execute(text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :num LIMIT 1'), {"novel_id": payload.novelId, "num": num})).mappings().first()
+        action = "add" if not chapter else "replace"
+        txt = storage.read_text(f"{asset_id}/{num}.txt")
+        h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+        await db.execute(
+            text(
+                'INSERT INTO "ImportCandidateChapter" (id, "jobId", "candidateNumber", "candidateTitle", "candidateHash", "matchedChapterId", action, reason) '
+                'VALUES (:id,:job,:num,:title,:hash,:matched,:action,:reason)'
+            ),
+            {
+                "id": _new_id("ic_"),
+                "job": job_id,
+                "num": num,
+                "title": title,
+                "hash": h,
+                "matched": chapter["id"] if chapter else None,
+                "action": action,
+                "reason": "number_match" if chapter else "missing_in_novel",
+            },
+        )
+        created += 1
+    await db.commit()
+    return {"jobId": job_id, "novelId": payload.novelId, "candidates": created}
+
+
+@app.post("/api/import/jobs/{job_id}/apply")
+async def apply_import_job(
+    job_id: str,
+    payload: ImportApplyPayload,
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    job = (await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})).mappings().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Import job not found")
+    asset_id = str(job["sourceAssetId"])
+
+    rows = (await db.execute(text('SELECT id, "candidateNumber", "matchedChapterId", action FROM "ImportCandidateChapter" WHERE "jobId" = :job ORDER BY "candidateNumber"'), {"job": job_id})).mappings().all()
+    added = 0
+    replaced = 0
+    for r in rows:
+        num = int(r["candidateNumber"])
+        do_replace = False
+        if payload.replaceMode == "selected" and num in payload.selectedChapterNumbers:
+            do_replace = True
+        if payload.replaceMode == "range" and payload.rangeStart and payload.rangeEnd and payload.rangeStart <= num <= payload.rangeEnd:
+            do_replace = True
+        txt_href = f"{asset_id}/{num}.txt"
+        raw_href = f"{asset_id}/{num}.raw.html"
+        txt = storage.read_text(txt_href)
+        h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
+        if r["matchedChapterId"] and do_replace:
+            await db.execute(text('UPDATE "ChapterMeta" SET title = :title WHERE id = :id'), {"id": r["matchedChapterId"], "title": f"Chapter {num}"})
+            await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") VALUES (:id,:txt,:raw,:hash) ON CONFLICT ("chapterId") DO UPDATE SET "txtHref"=EXCLUDED."txtHref", "rawHtmlHref"=EXCLUDED."rawHtmlHref", "contentHash"=EXCLUDED."contentHash", "updatedAt"=NOW()'), {"id": r["matchedChapterId"], "txt": txt_href, "raw": raw_href, "hash": h})
+            replaced += 1
+        elif not r["matchedChapterId"]:
+            cid = _new_id("cmeta_")
+            await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": payload.novelId, "num": num, "title": f"Chapter {num}"})
+            await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") VALUES (:id,:txt,:raw,:hash)'), {"id": cid, "txt": txt_href, "raw": raw_href, "hash": h})
+            added += 1
+    await db.commit()
+    return {"jobId": job_id, "added": added, "replaced": replaced}
 
 
 @app.post("/api/import/jobs/{job_id}/apply-mapping")
@@ -1961,6 +5030,10 @@ async def complete_import_job(
             'WHERE "sourceAssetId" = :asset_id AND status != :status'
         ),
         {"asset_id": row["sourceAssetId"], "status": "completed"},
+    )
+    await db.execute(
+        text('UPDATE "SourceAsset" SET status = :status, review_status = :review_status, "updatedAt" = NOW() WHERE id = :id'),
+        {"id": row["sourceAssetId"], "status": "completed", "review_status": "imported"},
     )
     await db.commit()
     return {"jobId": job_id, "status": "completed", "sourceAssetId": row["sourceAssetId"]}
@@ -2586,15 +5659,18 @@ async def save_user_settings(
 async def list_recommendations(request: Request, db: AsyncSession = Depends(get_db_session)):
     user = await require_current_user(request, db)
 
-    docs = (
-        await db.execute(
-            text(
-                'SELECT id, "novelId", "createdAt" FROM "UserRecommendationDoc" '
-                'WHERE "userId" = :user_id ORDER BY "createdAt" DESC LIMIT 1000'
-            ),
-            {"user_id": user["id"]},
-        )
-    ).mappings().all()
+    try:
+        docs = (
+            await db.execute(
+                text(
+                    'SELECT id, "novelId", "createdAt" FROM "UserRecommendationDoc" '
+                    'WHERE "userId" = :user_id ORDER BY "createdAt" DESC LIMIT 1000'
+                ),
+                {"user_id": user["id"]},
+            )
+        ).mappings().all()
+    except Exception:
+        return []
 
     novel_ids = list({doc.get("novelId") for doc in docs if doc.get("novelId")})
     novel_map: dict[str, dict[str, Any]] = {}
@@ -2649,12 +5725,15 @@ async def create_recommendation(
     if not novel_exists:
         raise HTTPException(status_code=404, detail="Truyện không tồn tại")
 
-    existing = (
-        await db.execute(
-            text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
-            {"user_id": user["id"], "novel_id": payload.novelId},
-        )
-    ).mappings().first()
+    try:
+        existing = (
+            await db.execute(
+                text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
+                {"user_id": user["id"], "novel_id": payload.novelId},
+            )
+        ).mappings().first()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Recommendation service is initializing") from exc
     if existing:
         raise HTTPException(status_code=409, detail="Bạn đã đề cử truyện này rồi")
 
@@ -2685,12 +5764,15 @@ async def delete_recommendation(
 ):
     user = await require_current_user(request, db)
 
-    existing = (
-        await db.execute(
-            text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
-            {"user_id": user["id"], "novel_id": novelId},
-        )
-    ).mappings().first()
+    try:
+        existing = (
+            await db.execute(
+                text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
+                {"user_id": user["id"], "novel_id": novelId},
+            )
+        ).mappings().first()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Recommendation service is initializing") from exc
     if not existing:
         raise HTTPException(status_code=404, detail="Bạn chưa đề cử truyện này")
 

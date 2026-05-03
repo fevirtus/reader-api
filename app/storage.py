@@ -29,5 +29,19 @@ class NasContentStorage:
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         return {"href": href, "sha256": digest, "size": len(content.encode("utf-8"))}
 
+    def delete_href(self, href: str) -> bool:
+        path = self._resolve(href)
+        if not path.exists() or not path.is_file():
+            return False
+        path.unlink(missing_ok=True)
+        parent = path.parent
+        while parent != self.root:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+        return True
+
 
 storage = NasContentStorage(settings.nas_content_root)

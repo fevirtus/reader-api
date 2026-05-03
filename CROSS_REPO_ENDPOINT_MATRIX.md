@@ -26,9 +26,17 @@ Legend:
 | Comment | `GET/POST /api/truyen/{id}/comments` | Y | Y | Y | |
 | Rating | `POST /api/truyen/{id}/rate` | Y | Y | N | Mobile chua thay rating flow |
 | Search | `GET /api/truyen/suggest` | Y | Y | N | Mobile search suggest can bo sung |
+| Import | `GET /api/import/assets/search` | Y | Y | N | Web MOD import wizard step 1 |
+| Import | `GET /api/import/assets/{id}/preview-metadata` | Y | Y | N | Web MOD import wizard step 2 |
+| Import | `POST /api/import/assets/{id}/ai-suggest` | Y | Y | N | Gen toi da 6 genres + short description |
+| Import | `POST /api/import/assets/{id}/review` | Y | Y | N | Save reviewed metadata before import |
+| Import | `POST /api/import/assets/{id}/parse-preview` | Y | Y | N | TOC/regex-start preview (10 head/mid/tail samples) |
+| Import | `POST /api/import/assets/{id}/start-import` | Y | Y | N | Start import session |
+| Import | `GET /api/import/sessions/{sessionId}` | Y | Y | N | Poll import progress |
 
 ## Priority gaps de dong bo tiep
 
 1. Mobile: `user/settings`, `recommendations`, `rate`, `suggest`.
 2. Web/Mobile chapter-read strategy can unify (`chapters/{id}` vs `by-number`).
 3. Chuan hoa error contract implementation theo `CONTRACT.md`.
+4. Mobile import flow currently not planned (MOD-only on web).
