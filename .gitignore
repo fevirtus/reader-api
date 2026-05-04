@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 dist/
 build/
+node_modules/
 
 .DS_Store
 .env
@@ -17,3 +18,4 @@ test_*.py
 data/epub-source/*
 data/content/*
 data/nas-content/*
+node_modules

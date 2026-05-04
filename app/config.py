@@ -28,8 +28,6 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-chat"
     openrouter_key: str = ""
     openrouter_paused: str = "true"
-    import_scan_interval_minutes: int = 30
-    import_scan_limit: int = 2000
 
     @property
     def google_client_id_list(self) -> list[str]:

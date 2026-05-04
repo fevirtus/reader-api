@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -10,6 +11,8 @@ import re
 import secrets
 import tempfile
 import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,18 +37,9 @@ from app.storage import storage
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _SCAN_TASK
     if str(settings.auto_schema_bootstrap).lower() in {"1", "true", "yes", "on"}:
         await _ensure_migration_tables()
-    if _SCAN_TASK is None or _SCAN_TASK.done():
-        _SCAN_TASK = asyncio.create_task(_scan_loop(), name="import-scan-loop")
     yield
-    if _SCAN_TASK and not _SCAN_TASK.done():
-        _SCAN_TASK.cancel()
-        try:
-            await _SCAN_TASK
-        except asyncio.CancelledError:
-            pass
 
 
 async def _ensure_migration_tables() -> None:
@@ -191,7 +185,18 @@ async def _ensure_migration_tables() -> None:
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
-_SCAN_TASK: asyncio.Task[Any] | None = None
+
+@app.middleware("http")
+async def disable_legacy_import_routes(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/import") and path != "/api/import/uploads/preview":
+        return Response(
+            content=json.dumps({"detail": "Legacy import endpoints are removed"}),
+            status_code=410,
+            media_type="application/json",
+        )
+    return await call_next(request)
+
 _IMPORT_TASKS: set[asyncio.Task[Any]] = set()
 
 
@@ -201,87 +206,6 @@ def _normalized_search_name(value: str) -> str:
     stem = base.rsplit(".", 1)[0]
     return _norm_title(stem)
 
-
-async def _discover_assets_incremental(limit: int = 2000) -> dict[str, int]:
-    from app.database import SessionLocal
-
-    root = Path(settings.epub_source_root)
-    if not root.exists():
-        return {"scanned": 0, "discovered": 0, "updated": 0}
-
-    found = sorted(root.rglob("*.epub"))[: max(1, limit)]
-    discovered = 0
-    updated = 0
-    scanned = 0
-
-    session = SessionLocal()
-    try:
-        for epub_path in found:
-            stat = epub_path.stat()
-            rel_path = str(epub_path.relative_to(root))
-            scanned += 1
-            sha256_now = _asset_file_sha256(epub_path)
-            existing = (
-                await session.execute(
-                    text('SELECT id, sha256, size_bytes, mtime_epoch FROM "SourceAsset" WHERE sha256 = :sha LIMIT 1'),
-                    {"sha": sha256_now},
-                )
-            ).mappings().first()
-            changed = (
-                not existing
-                or int(existing.get("size_bytes") or -1) != int(stat.st_size)
-                or int(existing.get("mtime_epoch") or -1) != int(stat.st_mtime)
-            )
-            sha256 = sha256_now if changed else str(existing.get("sha256") or sha256_now)
-            now_epoch = int(stat.st_mtime)
-
-            if existing:
-                await session.execute(
-                    text(
-                        'UPDATE "SourceAsset" SET sha256 = :sha, size_bytes = :size, mtime_epoch = :mtime, '
-                        'search_name = :search_name, "lastScannedAt" = NOW(), "updatedAt" = NOW() WHERE id = :id'
-                    ),
-                    {
-                        "id": existing["id"],
-                        "sha": sha256,
-                        "size": int(stat.st_size),
-                        "mtime": now_epoch,
-                        "search_name": _normalized_search_name(rel_path),
-                    },
-                )
-                updated += 1
-            else:
-                await session.execute(
-                    text(
-                        'INSERT INTO "SourceAsset" (id, path, sha256, status, search_name, size_bytes, mtime_epoch, "lastScannedAt") '
-                        'VALUES (:id, :path, :sha, :status, :search_name, :size, :mtime, NOW())'
-                    ),
-                    {
-                        "id": _new_id("asset_"),
-                        "path": rel_path,
-                        "sha": sha256,
-                        "status": "discovered",
-                        "search_name": _normalized_search_name(rel_path),
-                        "size": int(stat.st_size),
-                        "mtime": now_epoch,
-                    },
-                )
-                discovered += 1
-        await session.commit()
-    finally:
-        await session.close()
-
-    return {"scanned": scanned, "discovered": discovered, "updated": updated}
-
-
-async def _scan_loop() -> None:
-    interval_seconds = max(60, int(settings.import_scan_interval_minutes) * 60)
-    while True:
-        try:
-            await _discover_assets_incremental(limit=settings.import_scan_limit)
-        except Exception:
-            pass
-        await asyncio.sleep(interval_seconds)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1017,32 +941,10 @@ async def _resolve_series_id(
     series_id: str | None,
     series_name: str | None,
 ) -> str | None:
+    _ = db
+    _ = series_name
     sid = str(series_id or "").strip()
-    if sid:
-        exists = (await db.execute(text('SELECT id FROM "Series" WHERE id = :id LIMIT 1'), {"id": sid})).mappings().first()
-        if exists:
-            return sid
-        raise HTTPException(status_code=400, detail="Series not found")
-
-    name = " ".join((series_name or "").split()).strip()
-    if not name:
-        return None
-    slug = _norm_title(name).replace(" ", "-")[:120] or _new_id("series_")
-    existing = (
-        await db.execute(
-            text('SELECT id FROM "Series" WHERE lower(name) = :name OR slug = :slug LIMIT 1'),
-            {"name": name.lower(), "slug": slug},
-        )
-    ).mappings().first()
-    if existing:
-        return str(existing["id"])
-    sid = _new_id("series_")
-    slug = await _ensure_unique_slug(db, table="Series", slug=slug)
-    await db.execute(
-        text('INSERT INTO "Series" (id, name, slug, description, "createdAt", "updatedAt") VALUES (:id, :name, :slug, :description, NOW(), NOW())'),
-        {"id": sid, "name": name, "slug": slug, "description": None},
-    )
-    return sid
+    return sid or None
 
 
 async def _set_novel_genres(db: AsyncSession, novel_id: str, genre_ids: list[str]) -> None:
@@ -1116,107 +1018,7 @@ async def _delete_novel_by_id(db: AsyncSession, novel_id: str) -> bool:
     return bool(deleted)
 
 
-@app.get("/api/mod/series")
-async def mod_list_series(
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    rows = (
-        await db.execute(
-            text(
-                'SELECT s.id, s.name, s.slug, s.description, COUNT(n.id)::int AS novels_count '
-                'FROM "Series" s LEFT JOIN "Novel" n ON n."seriesId" = s.id '
-                'GROUP BY s.id ORDER BY s.name ASC'
-            )
-        )
-    ).mappings().all()
-    return [
-        {
-            "id": r["id"],
-            "name": r["name"],
-            "slug": r["slug"],
-            "description": r.get("description"),
-            "_count": {"novels": int(r.get("novels_count") or 0)},
-        }
-        for r in rows
-    ]
 
-
-@app.post("/api/mod/series")
-async def mod_create_series(
-    payload: ModSeriesPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    name = " ".join((payload.name or "").split()).strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Tên series không hợp lệ")
-    slug = _norm_title(name).replace(" ", "-")[:120] or _new_id("series_")
-    existing = (
-        await db.execute(
-            text('SELECT id, name, slug, description FROM "Series" WHERE lower(name)=:name OR slug=:slug LIMIT 1'),
-            {"name": name.lower(), "slug": slug},
-        )
-    ).mappings().first()
-    if existing:
-        return dict(existing)
-    slug = await _ensure_unique_slug(db, table="Series", slug=slug)
-    row = (
-        await db.execute(
-            text('INSERT INTO "Series" (id, name, slug, description, "createdAt", "updatedAt") VALUES (:id,:name,:slug,:description,NOW(),NOW()) RETURNING id, name, slug, description'),
-            {"id": _new_id("series_"), "name": name, "slug": slug, "description": payload.description},
-        )
-    ).mappings().first()
-    await db.commit()
-    return dict(row) if row else {}
-
-
-@app.put("/api/mod/series")
-async def mod_update_series(
-    payload: ModSeriesPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    sid = str(payload.id or "").strip()
-    if not sid:
-        raise HTTPException(status_code=400, detail="id là bắt buộc")
-    name = " ".join((payload.name or "").split()).strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Tên series không hợp lệ")
-    slug = _norm_title(name).replace(" ", "-")[:120] or sid
-    slug = await _ensure_unique_slug(db, table="Series", slug=slug, current_id=sid)
-    row = (
-        await db.execute(
-            text('UPDATE "Series" SET name=:name, slug=:slug, description=:description, "updatedAt"=NOW() WHERE id=:id RETURNING id, name, slug, description'),
-            {"id": sid, "name": name, "slug": slug, "description": payload.description},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Series not found")
-    await db.commit()
-    return dict(row)
-
-
-@app.delete("/api/mod/series")
-async def mod_delete_series(
-    id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await db.execute(text('UPDATE "Novel" SET "seriesId" = NULL, "updatedAt" = NOW() WHERE "seriesId" = :id'), {"id": id})
-    row = (await db.execute(text('DELETE FROM "Series" WHERE id = :id RETURNING id'), {"id": id})).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Series not found")
-    await db.commit()
-    return {"id": id, "deleted": True}
 
 
 @app.get("/api/mod/truyen")
@@ -1230,8 +1032,8 @@ async def mod_list_novels(
         await db.execute(
             text(
                 'SELECT n.id, n.title, n.slug, n."authorName", n.status, n."totalChapters", n."coverUrl", '
-                's.id AS series_id, s.name AS series_name, s.slug AS series_slug '
-                'FROM "Novel" n LEFT JOIN "Series" s ON s.id = n."seriesId" '
+                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
+                'FROM "Novel" n '
                 'ORDER BY n."updatedAt" DESC, n."createdAt" DESC'
             )
         )
@@ -1268,8 +1070,8 @@ async def mod_get_novel_detail(
             text(
                 'SELECT n.id, n.title, n.slug, n."authorName", n."originalTitle", n."originalAuthorName", '
                 'n.description, n."coverUrl", n.status, n."totalChapters", '
-                's.id AS series_id, s.name AS series_name, s.slug AS series_slug '
-                'FROM "Novel" n LEFT JOIN "Series" s ON s.id = n."seriesId" WHERE n.id = :id LIMIT 1'
+                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
+                'FROM "Novel" n WHERE n.id = :id LIMIT 1'
             ),
             {"id": novel_id},
         )
@@ -1483,15 +1285,15 @@ async def mod_list_missing_novels(
         where_parts.append(f"({' OR '.join(filters)})")
     if q.strip():
         params["q"] = f"%{q.strip()}%"
-        where_parts.append('(n.title ILIKE :q OR n.slug ILIKE :q OR n."authorName" ILIKE :q OR s.name ILIKE :q)')
+        where_parts.append('(n.title ILIKE :q OR n.slug ILIKE :q OR n."authorName" ILIKE :q)')
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     rows = (
         await db.execute(
             text(
                 'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", n.description, n."totalChapters", n."updatedAt", '
-                's.id AS series_id, s.name AS series_name, s.slug AS series_slug '
-                'FROM "Novel" n LEFT JOIN "Series" s ON s.id = n."seriesId" '
+                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
+                'FROM "Novel" n '
                 f'{where_sql} '
                 'ORDER BY n."updatedAt" DESC, n.title ASC LIMIT 2000'
             ),
@@ -1609,7 +1411,7 @@ async def mod_overview(
     novel_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Novel"'))).scalar_one()
     total_views = (await db.execute(text('SELECT COALESCE(SUM(views),0)::int FROM "Novel"'))).scalar_one()
     comment_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Comment"'))).scalar_one()
-    series_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Series"'))).scalar_one()
+    series_count = 0
     return {
         "novelCount": int(novel_count or 0),
         "totalViews": int(total_views or 0),
@@ -2192,10 +1994,25 @@ async def mod_epub_upload(
         mode = "regex" if (splitMode or "").lower() == "regex" else "toc"
         pattern = (chapterRegex or "").strip() or None
         chapters = _epub_extract_with_mode(tmp_path, mode, pattern)
-        base_title = " ".join((title or Path(file.filename or "novel").stem).split()).strip() or "Untitled"
-        base_author = " ".join((authorName or "Unknown").split()).strip() or "Unknown"
-        base_desc = (description or "").strip()
-        has_cover = bool(_extract_epub_cover(tmp_path))
+        epub_meta = _extract_epub_metadata(tmp_path)
+        inferred_title = str(epub_meta.get("title") or Path(file.filename or "novel").stem)
+        inferred_author = str(epub_meta.get("author") or "Unknown")
+        inferred_desc = str(epub_meta.get("description") or "")
+        inferred_genres = [str(g).strip() for g in (epub_meta.get("genres") or []) if str(g).strip()]
+
+        base_title = " ".join((title or inferred_title).split()).strip() or "Untitled"
+        base_author = " ".join((authorName or inferred_author).split()).strip() or "Unknown"
+        base_desc = (description if description is not None else inferred_desc).strip()
+        cover_extracted = _extract_epub_cover(tmp_path) or _extract_epub_cover_from_zip(tmp_path)
+        has_cover = bool(cover_extracted)
+        cover_preview_data_url: str | None = None
+        uploaded_cover_url: str | None = None
+        if cover_extracted:
+            cover_bytes, cover_ext = cover_extracted
+            cover_ext = _guess_image_extension(cover_bytes)
+            mime = _mime_from_extension(cover_ext)
+            cover_preview_data_url = f"data:{mime};base64,{base64.b64encode(cover_bytes).decode('ascii')}"
+            uploaded_cover_url = _upload_cover_bytes_to_r2(cover_bytes, cover_ext, key_prefix=f"epub-cover-{_new_id()}")
 
         if str(preview or "").lower() == "true":
             return {
@@ -2204,6 +2021,7 @@ async def mod_epub_upload(
                 "splitMode": mode,
                 "detectedStructureType": "standard",
                 "hasCoverFromEpub": has_cover,
+                "coverPreviewDataUrl": cover_preview_data_url,
                 "parserInfo": {
                     "splitMode": mode,
                     "chapterRegexUsed": pattern,
@@ -2218,7 +2036,7 @@ async def mod_epub_upload(
                     "title": base_title,
                     "authorName": base_author,
                     "description": base_desc,
-                    "detectedGenres": [],
+                    "detectedGenres": inferred_genres,
                     "totalChapters": len(chapters),
                 },
                 "chaptersPreview": [
@@ -2309,12 +2127,12 @@ async def mod_epub_upload(
             await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" IN (SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id)'), {"novel_id": novel_id})
             await db.execute(text('DELETE FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
             await db.execute(
-                text('UPDATE "Novel" SET "authorName" = :author, description = :desc, "coverUrl" = COALESCE("coverUrl", :cover), "seriesId" = :series_id, "updatedAt" = NOW() WHERE id = :id'),
+                text('UPDATE "Novel" SET "authorName" = :author, description = :desc, "coverUrl" = COALESCE(:cover, "coverUrl"), "seriesId" = :series_id, "updatedAt" = NOW() WHERE id = :id'),
                 {
                     "id": novel_id,
                     "author": base_author,
                     "desc": base_desc,
-                    "cover": None,
+                    "cover": uploaded_cover_url,
                     "series_id": target_series_id,
                 },
             )
@@ -2329,7 +2147,7 @@ async def mod_epub_upload(
                     "slug": slug,
                     "author": base_author,
                     "desc": base_desc,
-                    "cover": None,
+                    "cover": uploaded_cover_url,
                     "status": "Đang ra",
                     "series_id": target_series_id,
                 },
@@ -2418,7 +2236,7 @@ async def browse_novels(
         params["q"] = f"%{q.strip()}%"
         where_parts.append(
             '(n.title ILIKE :q OR n."originalTitle" ILIKE :q OR n."authorName" ILIKE :q '
-            'OR n."originalAuthorName" ILIKE :q OR s.name ILIKE :q)'
+            'OR n."originalAuthorName" ILIKE :q)'
         )
 
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
@@ -2426,11 +2244,10 @@ async def browse_novels(
     base_select = (
         'n.id, n.title, n.slug, n."originalTitle", n."authorName", n."coverUrl", n."coverColor", '
         'n.status, n."totalChapters", n.views, n.rating, n."ratingCount", n."bookmarkCount", '
-        'n."seriesId", s.id AS series_id, s.name AS series_name, s.slug AS series_slug, n."updatedAt"'
+        'n."seriesId", NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug, n."updatedAt"'
     )
     base_from = (
         'FROM "Novel" n '
-        'LEFT JOIN "Series" s ON s.id = n."seriesId" '
     )
 
     if collapse_series:
@@ -2549,9 +2366,8 @@ async def get_novel_detail(id_or_slug: str, db: AsyncSession = Depends(get_db_se
                 'SELECT n.id, n.title, n.slug, n."originalTitle", n."authorName", n."originalAuthorName", '
                 'n.description, n."coverUrl", n."coverColor", n.status, n."totalChapters", n.views, n.rating, '
                 'n."ratingCount", n."bookmarkCount", n."seriesId", n."createdAt", n."updatedAt", '
-                's.id AS series_id, s.name AS series_name, s.slug AS series_slug '
+                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
                 'FROM "Novel" n '
-                'LEFT JOIN "Series" s ON s.id = n."seriesId" '
                 'WHERE n.id = :value OR n.slug = :value '
                 'LIMIT 1'
             ),
@@ -2761,10 +2577,9 @@ async def suggest_novels(q: str = "", db: AsyncSession = Depends(get_db_session)
     rows = (
         await db.execute(
             text(
-                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", s.id AS series_id, s.name AS series_name '
+                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", NULL::text AS series_id, NULL::text AS series_name '
                 'FROM "Novel" n '
-                'LEFT JOIN "Series" s ON s.id = n."seriesId" '
-                'WHERE n.title ILIKE :q OR n."authorName" ILIKE :q OR s.name ILIKE :q '
+                'WHERE n.title ILIKE :q OR n."authorName" ILIKE :q '
                 'ORDER BY n.views DESC, n."updatedAt" DESC '
                 'LIMIT 8'
             ),
@@ -2872,12 +2687,6 @@ class SourceAssetStartImportPayload(BaseModel):
 class SourceAssetAiSuggestPayload(BaseModel):
     splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
     chapterStartPattern: str | None = None
-
-
-class ModSeriesPayload(BaseModel):
-    id: str | None = None
-    name: str
-    description: str | None = None
 
 
 class ModNovelPayload(BaseModel):
@@ -3308,6 +3117,21 @@ def _extract_epub_cover(epub_path: Path) -> tuple[bytes, str] | None:
     except Exception:
         return None
 
+    try:
+        direct_cover = book.get_cover()
+        if direct_cover and len(direct_cover) >= 2:
+            cover_bytes = direct_cover[1]
+            if cover_bytes:
+                name = str(direct_cover[0] or "").lower()
+                ext = ".jpg"
+                if name.endswith(".png"):
+                    ext = ".png"
+                elif name.endswith(".webp"):
+                    ext = ".webp"
+                return cover_bytes, ext
+    except Exception:
+        pass
+
     for item in book.get_items():
         try:
             media_type = str(getattr(item, "media_type", "") or "")
@@ -3352,6 +3176,208 @@ def _extract_epub_cover(epub_path: Path) -> tuple[bytes, str] | None:
         except Exception:
             continue
     return None
+
+
+def _extract_epub_cover_from_zip(epub_path: Path) -> tuple[bytes, str] | None:
+    try:
+        with zipfile.ZipFile(epub_path, "r") as zf:
+            names = zf.namelist()
+            lower_map = {name.lower(): name for name in names}
+            preferred = [
+                "cover.jpg", "cover.jpeg", "cover.png", "cover.webp",
+                "images/cover.jpg", "images/cover.jpeg", "images/cover.png", "images/cover.webp",
+                "oebps/cover.jpg", "oebps/cover.jpeg", "oebps/cover.png", "oebps/cover.webp",
+            ]
+            for candidate in preferred:
+                actual = lower_map.get(candidate)
+                if not actual:
+                    continue
+                data = zf.read(actual)
+                if data:
+                    return data, _guess_image_extension(data)
+
+            for name in names:
+                low = name.lower()
+                if not low.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                    continue
+                if "cover" not in low:
+                    continue
+                data = zf.read(name)
+                if data:
+                    return data, _guess_image_extension(data)
+    except Exception:
+        return None
+    return None
+
+
+def _extract_epub_metadata(epub_path: Path) -> dict[str, Any]:
+    from ebooklib import epub as epublib
+
+    try:
+        book = epublib.read_epub(str(epub_path), options={"ignore_ncx": False})
+    except Exception:
+        return {"title": None, "author": None, "description": None, "genres": []}
+
+    def _first_text(namespace: str, key: str) -> str | None:
+        try:
+            values = book.get_metadata(namespace, key)
+        except Exception:
+            values = []
+        for value in values or []:
+            raw = value[0] if isinstance(value, tuple) else value
+            text_value = str(raw or "").strip()
+            if text_value:
+                return text_value
+        return None
+
+    title = _first_text("DC", "title")
+    author = _first_text("DC", "creator")
+    description = _first_text("DC", "description")
+
+    subjects: list[str] = []
+    try:
+        for value in book.get_metadata("DC", "subject") or []:
+            raw = value[0] if isinstance(value, tuple) else value
+            text_value = str(raw or "").strip()
+            if text_value:
+                subjects.append(text_value)
+    except Exception:
+        pass
+
+    result = {
+        "title": title,
+        "author": author,
+        "description": description,
+        "genres": subjects[:8],
+    }
+    if result["title"] or result["author"] or result["description"] or result["genres"]:
+        return result
+
+    try:
+        with zipfile.ZipFile(epub_path, "r") as zf:
+            container_xml = zf.read("META-INF/container.xml")
+            croot = ET.fromstring(container_xml)
+            rootfile = croot.find('.//{*}rootfile')
+            if rootfile is None:
+                return result
+            opf_path = rootfile.attrib.get("full-path")
+            if not opf_path:
+                return result
+            opf_xml = zf.read(opf_path)
+            oroot = ET.fromstring(opf_xml)
+            t = oroot.find('.//{*}title')
+            a = oroot.find('.//{*}creator')
+            d = oroot.find('.//{*}description')
+            s = oroot.findall('.//{*}subject')
+            title2 = (t.text or "").strip() if t is not None and t.text else None
+            author2 = (a.text or "").strip() if a is not None and a.text else None
+            desc2 = (d.text or "").strip() if d is not None and d.text else None
+            genres2 = [str(x.text or "").strip() for x in s if x is not None and str(x.text or "").strip()][:8]
+            return {
+                "title": title2,
+                "author": author2,
+                "description": desc2,
+                "genres": genres2,
+            }
+    except Exception:
+        return result
+
+    return result
+
+
+def _guess_image_extension(image_bytes: bytes) -> str:
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:16]:
+        return ".webp"
+    if image_bytes.startswith(b"GIF87a") or image_bytes.startswith(b"GIF89a"):
+        return ".gif"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    return ".jpg"
+
+
+def _mime_from_extension(ext: str) -> str:
+    if ext == ".png":
+        return "image/png"
+    if ext == ".webp":
+        return "image/webp"
+    if ext == ".gif":
+        return "image/gif"
+    return "image/jpeg"
+
+
+def _resolve_epub_source_path(asset_path: str, sha256_hint: str | None = None) -> Path | None:
+    raw = str(asset_path or "").strip()
+    if not raw:
+        return None
+
+    direct = Path(raw)
+    if direct.exists():
+        return direct
+
+    root = Path(settings.epub_source_root)
+    candidate = root / raw
+    if candidate.exists():
+        return candidate
+
+    normalized = raw.replace("\\", "/")
+    candidate2 = root / normalized
+    if candidate2.exists():
+        return candidate2
+
+    basename = Path(normalized).name
+    if basename:
+        try:
+            matches = list(root.rglob(basename))
+            if matches:
+                return matches[0]
+        except Exception:
+            pass
+
+    if sha256_hint:
+        target_sha = str(sha256_hint).strip().lower()
+        if target_sha:
+            try:
+                for candidate in root.rglob("*.epub"):
+                    try:
+                        if _asset_file_sha256(candidate).lower() == target_sha:
+                            return candidate
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+    return None
+
+
+def _extract_epub_preview_payload(epub_path: Path) -> dict[str, Any]:
+    cover = _extract_epub_cover(epub_path) or _extract_epub_cover_from_zip(epub_path)
+    cover_bytes: bytes | None = None
+    cover_ext: str | None = None
+    cover_data_url: str | None = None
+    if cover:
+        cover_bytes, cover_ext = cover
+        cover_ext = _guess_image_extension(cover_bytes)
+        mime = _mime_from_extension(cover_ext)
+        cover_data_url = f"data:{mime};base64,{base64.b64encode(cover_bytes).decode('ascii')}"
+
+    meta = _extract_epub_metadata(epub_path)
+    title = str(meta.get("title") or "").strip() or epub_path.stem
+    author = str(meta.get("author") or "").strip() or "Unknown"
+    description = str(meta.get("description") or "").strip()
+    genres = [str(g).strip() for g in (meta.get("genres") or []) if str(g).strip()][:8]
+
+    return {
+        "coverFound": bool(cover_bytes),
+        "coverBytes": cover_bytes,
+        "coverExt": cover_ext,
+        "coverPreviewDataUrl": cover_data_url,
+        "title": title,
+        "author": author,
+        "description": description,
+        "genres": genres,
+    }
 
 
 def _upload_cover_bytes_to_r2(image_bytes: bytes, extension: str, *, key_prefix: str) -> str | None:
@@ -3719,17 +3745,61 @@ async def preview_source_asset_metadata(
 
     path = str(row["path"])
     base = path.split("/")[-1].rsplit(".", 1)[0]
-    source_path = Path(settings.epub_source_root) / path
-    cover_detected = bool(_extract_epub_cover(source_path)) if source_path.exists() else False
+    source_path = _resolve_epub_source_path(path, str(row.get("sha256") or ""))
+    preview = _extract_epub_preview_payload(source_path) if source_path else None
     return {
-        "asset": {**dict(row), "coverDetected": cover_detected},
+        "asset": {**dict(row), "coverDetected": bool(preview and preview.get("coverFound"))},
         "suggested": {
-            "title": row.get("title") or base,
-            "author": row.get("author") or "Unknown",
-            "shortDescription": None,
-            "genres": [],
+            "title": (preview.get("title") if preview else None) or row.get("title") or base,
+            "author": (preview.get("author") if preview else None) or row.get("author") or "Unknown",
+            "shortDescription": (preview.get("description") if preview else None) or None,
+            "genres": (preview.get("genres") if preview else None) or [],
+        },
+        "debug": {
+            "sourcePathResolved": str(source_path) if source_path else None,
+            "sourcePathExists": bool(source_path and source_path.exists()),
+            "coverFound": bool(preview and preview.get("coverFound")),
+            "coverExt": preview.get("coverExt") if preview else None,
+            "titleFromEpub": preview.get("title") if preview else None,
+            "authorFromEpub": preview.get("author") if preview else None,
         },
     }
+
+
+@app.post("/api/import/uploads/preview")
+async def upload_epub_and_preview(
+    file: UploadFile = File(...),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty EPUB")
+
+    suffix = ".epub"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(raw)
+        tmp_path = Path(tmp.name)
+
+    try:
+        preview = _extract_epub_preview_payload(tmp_path)
+        return {
+            "suggested": {
+                "title": preview.get("title"),
+                "author": preview.get("author"),
+                "shortDescription": preview.get("description") or None,
+                "genres": preview.get("genres") or [],
+            },
+            "coverDetected": bool(preview.get("coverFound")),
+            "coverPreviewDataUrl": preview.get("coverPreviewDataUrl"),
+        }
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 @app.get("/api/import/assets/{asset_id}/preview-cover")
@@ -3741,23 +3811,20 @@ async def preview_source_asset_cover(
     if user.get("role") not in ("MOD", "ADMIN"):
         raise HTTPException(status_code=403, detail="Forbidden")
     row = (
-        await db.execute(text('SELECT id, path FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
+        await db.execute(text('SELECT id, path, sha256 FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Source asset not found")
 
-    source_path = Path(settings.epub_source_root) / str(row["path"])
-    if not source_path.exists():
+    source_path = _resolve_epub_source_path(str(row["path"]), str(row.get("sha256") or ""))
+    if not source_path:
         raise HTTPException(status_code=400, detail="EPUB source file not found")
-    cover = _extract_epub_cover(source_path)
-    if not cover:
+    preview = _extract_epub_preview_payload(source_path)
+    cover_bytes = preview.get("coverBytes") if preview else None
+    if not cover_bytes:
         raise HTTPException(status_code=404, detail="Cover not found in EPUB")
-    cover_bytes, ext = cover
-    media_type = "image/jpeg"
-    if ext == ".png":
-        media_type = "image/png"
-    elif ext == ".webp":
-        media_type = "image/webp"
+    ext = str(preview.get("coverExt") or ".jpg")
+    media_type = _mime_from_extension(ext)
     return Response(content=cover_bytes, media_type=media_type)
 
 
@@ -3862,8 +3929,8 @@ async def ai_suggest_source_asset(
     if not row:
         raise HTTPException(status_code=404, detail="Source asset not found")
 
-    source_path = Path(settings.epub_source_root) / str(row["path"])
-    if not source_path.exists():
+    source_path = _resolve_epub_source_path(str(row["path"]))
+    if not source_path or not source_path.exists():
         raise HTTPException(status_code=400, detail="EPUB source file not found")
 
     chapters = _epub_extract_with_mode(source_path, payload.splitMode, payload.chapterStartPattern)
@@ -3913,8 +3980,8 @@ async def parse_preview_source_asset(
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Source asset not found")
-    source_path = Path(settings.epub_source_root) / str(row["path"])
-    if not source_path.exists():
+    source_path = _resolve_epub_source_path(str(row["path"]))
+    if not source_path or not source_path.exists():
         raise HTTPException(status_code=400, detail="EPUB source file not found")
 
     chapters = _epub_extract_with_mode(source_path, payload.splitMode, payload.chapterStartPattern)
@@ -3951,8 +4018,8 @@ def _run_import_session_task(session_id: str) -> None:
             )
             await db.commit()
 
-            source_path = Path(settings.epub_source_root) / str(row["path"])
-            if not source_path.exists():
+            source_path = _resolve_epub_source_path(str(row["path"]))
+            if not source_path or not source_path.exists():
                 await db.execute(
                     text('UPDATE "ImportSession" SET status = :st, phase = :ph, log = :log, "updatedAt" = NOW() WHERE id = :id'),
                     {"id": session_id, "st": "failed", "ph": "prepare", "log": "EPUB source file not found"},
@@ -4409,18 +4476,6 @@ async def upsert_source_asset(
 
     await db.commit()
     return dict(row) if row else {}
-
-
-@app.post("/api/import/discover")
-async def discover_epub_assets(
-    limit: int = Query(default=200, ge=1, le=2000),
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    return await _discover_assets_incremental(limit=limit)
 
 
 @app.post("/api/import/assets/{asset_id}/approve")
