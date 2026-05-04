@@ -24,10 +24,8 @@ class Settings(BaseSettings):
     chapter_content_mode: str = "nas_first"
     auto_schema_bootstrap: str = "false"
 
-    deepseek_key: str = ""
-    deepseek_model: str = "deepseek-chat"
-    openrouter_key: str = ""
-    openrouter_paused: str = "true"
+    router_api_key: str = ""
+    router_base_url: str = "https://openrouter.ai/api/v1"
 
     @property
     def google_client_id_list(self) -> list[str]:

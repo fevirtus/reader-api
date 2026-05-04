@@ -10,6 +10,7 @@ import random
 import re
 import secrets
 import tempfile
+import time
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -3507,15 +3508,63 @@ def _map_genres_to_existing(candidates: list[str], existing_genres: list[str], *
     return output
 
 
-async def _deepseek_ai_suggest(
+_ROUTER_MODEL_CACHE: dict[str, Any] = {"expires_at": 0.0, "models": []}
+
+
+async def _router_pick_models() -> list[str]:
+    api_key = (settings.router_api_key or "").strip()
+
+    now = time.time()
+    if _ROUTER_MODEL_CACHE.get("expires_at", 0.0) > now:
+        return list(_ROUTER_MODEL_CACHE.get("models") or [])
+
+    candidates: list[tuple[int, str]] = []
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                f"{str(settings.router_base_url).rstrip('/')}/models",
+                headers=headers,
+            )
+        response.raise_for_status()
+        for item in (response.json().get("data") or []):
+            model_id = str(item.get("id") or "").strip()
+            if not model_id:
+                continue
+            low = model_id.lower()
+            if any(x in low for x in ["vision", "image", "audio", "realtime", "embedding", "moderation"]):
+                continue
+            score = 0
+            if "gpt-5.5" in low:
+                score += 1000
+            elif "gpt-5" in low:
+                score += 900
+            elif "claude" in low:
+                score += 700
+            elif "gemini" in low:
+                score += 650
+            else:
+                score += 100
+            candidates.append((score, model_id))
+    except Exception:
+        candidates = []
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    picked = [m for _, m in candidates[:6]]
+    _ROUTER_MODEL_CACHE["models"] = picked
+    _ROUTER_MODEL_CACHE["expires_at"] = now + 600
+    return picked
+
+
+async def _router_ai_suggest(
     title: str,
     author: str,
     chapters: list[dict[str, Any]],
     existing_genres: list[str],
 ) -> dict[str, Any] | None:
-    api_key = (settings.deepseek_key or "").strip()
-    if not api_key:
-        return None
+    api_key = (settings.router_api_key or "").strip()
 
     samples: list[str] = []
     if chapters:
@@ -3530,11 +3579,15 @@ async def _deepseek_ai_suggest(
 
     system_prompt = (
         "You are a Vietnamese fiction metadata assistant. "
-        "Return strict JSON with keys: genres, shortDescription, confidence. "
-        "genres must be array of 1-6 concise genre strings. "
-        "Prioritize selecting from existingGenres first; only create new genres when truly needed. "
-        "shortDescription must be 2-4 Vietnamese sentences. "
-        "confidence is number 0..1."
+        "Return ONLY valid JSON (no markdown, no explanation) with exactly keys: genres, shortDescription, confidence. "
+        "genres must be an array of 1-6 concise Vietnamese labels. "
+        "Prefer selecting from existingGenres when semantically close; create new genres only when no close match exists. "
+        "Do not output duplicates, slug format, or punctuation-only variants. "
+        "shortDescription must be 6-7 Vietnamese sentences, each sentence on a new line using newline characters. "
+        "Match tone and diction to the likely genre and make it emotionally engaging to increase reader curiosity. "
+        "No major spoilers, no quotes. "
+        "confidence must be a number from 0 to 1. "
+        "If uncertain, use broader/common genres rather than inventing niche ones."
     )
     user_prompt = {
         "title": title,
@@ -3549,8 +3602,7 @@ async def _deepseek_ai_suggest(
         },
     }
 
-    payload = {
-        "model": settings.deepseek_model,
+    base_payload = {
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
@@ -3560,38 +3612,44 @@ async def _deepseek_ai_suggest(
         "response_format": {"type": "json_object"},
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.deepseek.com/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-            )
-        response.raise_for_status()
-        data = response.json()
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
-        parsed = json.loads(content) if isinstance(content, str) else {}
-        raw_genres = [str(g).strip() for g in (parsed.get("genres") or []) if str(g).strip()][:6]
-        genres = _map_genres_to_existing(raw_genres, existing_genres, limit=6)
-        short_description = str(parsed.get("shortDescription") or "").strip()
-        try:
-            confidence = float(parsed.get("confidence") or 0.0)
-        except Exception:
-            confidence = 0.0
-        confidence = max(0.0, min(1.0, confidence))
-        if not short_description or not genres:
-            return None
-        return {
-            "suggestedGenres": genres,
-            "shortDescription": short_description,
-            "confidence": confidence,
-        }
-    except Exception:
+    models = await _router_pick_models()
+    if not models:
         return None
+    headers = {
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost:3000",
+        "X-Title": "reader-import-ai-suggest",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for model_id in models:
+        payload = dict(base_payload)
+        payload["model"] = model_id
+        try:
+            async with httpx.AsyncClient(timeout=45.0) as client:
+                response = await client.post(
+                    f"{str(settings.router_base_url).rstrip('/')}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = json.loads(content) if isinstance(content, str) else {}
+            raw_genres = [str(g).strip() for g in (parsed.get("genres") or []) if str(g).strip()][:6]
+            genres = _map_genres_to_existing(raw_genres, existing_genres, limit=6)
+            short_description = str(parsed.get("shortDescription") or "").strip()
+            try:
+                confidence = float(parsed.get("confidence") or 0.0)
+            except Exception:
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
+            if not short_description or not genres:
+                continue
+            return {"suggestedGenres": genres, "shortDescription": short_description, "confidence": confidence, "model": model_id}
+        except Exception:
+            continue
+    return None
 
 
 async def _resolve_chapter_content(chapter_id: str, db: AsyncSession) -> str | None:
@@ -3802,6 +3860,65 @@ async def upload_epub_and_preview(
             pass
 
 
+@app.post("/api/mod/epub/ai-suggest")
+async def mod_epub_ai_suggest(
+    file: UploadFile = File(...),
+    splitMode: str | None = Form(default=None),
+    chapterRegex: str | None = Form(default=None),
+    title: str | None = Form(default=None),
+    authorName: str | None = Form(default=None),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty EPUB")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".epub") as tmp:
+        tmp.write(raw)
+        tmp_path = Path(tmp.name)
+
+    try:
+        mode = "regex" if (splitMode or "").lower() == "regex" else "toc"
+        pattern = (chapterRegex or "").strip() or None
+        chapters = _epub_extract_with_mode(tmp_path, mode, pattern)
+        meta = _extract_epub_metadata(tmp_path)
+        resolved_title = " ".join((title or str(meta.get("title") or tmp_path.stem)).split()).strip() or tmp_path.stem
+        resolved_author = " ".join((authorName or str(meta.get("author") or "Unknown")).split()).strip() or "Unknown"
+        existing_genres = [
+            str(r.get("name") or "")
+            for r in (await db.execute(text('SELECT name FROM "Genre" ORDER BY name ASC'))).mappings().all()
+            if str(r.get("name") or "").strip()
+        ]
+
+        ai_result = await _router_ai_suggest(resolved_title, resolved_author, chapters, existing_genres)
+        if ai_result:
+            return {
+                "suggestedGenres": ai_result["suggestedGenres"][:6],
+                "shortDescription": ai_result["shortDescription"],
+                "confidence": ai_result["confidence"],
+                "source": "router_dynamic",
+                "model": ai_result.get("model"),
+            }
+
+        fallback_genres = _map_genres_to_existing(_build_ai_genre_suggestions(chapters), existing_genres, limit=6)
+        fallback_desc = _build_ai_description(resolved_title, resolved_author, chapters)
+        return {
+            "suggestedGenres": fallback_genres[:6],
+            "shortDescription": fallback_desc,
+            "confidence": 0.62,
+            "source": "rule_based_fallback",
+        }
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 @app.get("/api/import/assets/{asset_id}/preview-cover")
 async def preview_source_asset_cover(
     asset_id: str,
@@ -3942,14 +4059,15 @@ async def ai_suggest_source_asset(
         if str(r.get("name") or "").strip()
     ]
 
-    ai_result = await _deepseek_ai_suggest(title, author, chapters, existing_genres)
+    ai_result = await _router_ai_suggest(title, author, chapters, existing_genres)
     if ai_result:
         return {
             "assetId": asset_id,
             "suggestedGenres": ai_result["suggestedGenres"][:6],
             "shortDescription": ai_result["shortDescription"],
             "confidence": ai_result["confidence"],
-            "source": "deepseek",
+            "source": "router_dynamic",
+            "model": ai_result.get("model"),
             "existingGenresCount": len(existing_genres),
         }
 
