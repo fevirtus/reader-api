@@ -1151,13 +1151,14 @@ async def mod_create_novel(
 
 @app.put("/api/mod/truyen")
 async def mod_update_novel(
-    payload: ModNovelPayload,
+    payload: dict[str, Any] = Body(...),
     db: AsyncSession = Depends(get_db_session),
     user: dict = Depends(require_current_user),
 ):
     if user.get("role") not in ("MOD", "ADMIN"):
         raise HTTPException(status_code=403, detail="Forbidden")
-    novel_id = str(payload.id or "").strip()
+    parsed = ModNovelPayload.model_validate(payload)
+    novel_id = str(parsed.id or "").strip()
     if not novel_id:
         raise HTTPException(status_code=400, detail="id là bắt buộc")
 
@@ -1167,21 +1168,21 @@ async def mod_update_novel(
     if not current:
         raise HTTPException(status_code=404, detail="Novel not found")
 
-    next_title = " ".join((payload.title or str(current.get("title") or "")).split()).strip()
-    next_author = " ".join((payload.authorName or "").split()).strip()
+    next_title = " ".join((parsed.title or str(current.get("title") or "")).split()).strip()
+    next_author = " ".join((parsed.authorName or "").split()).strip()
     if not next_title:
         raise HTTPException(status_code=400, detail="title không hợp lệ")
-    if payload.authorName is not None and not next_author:
+    if parsed.authorName is not None and not next_author:
         raise HTTPException(status_code=400, detail="authorName không hợp lệ")
 
     slug_base = _norm_title(next_title).replace(" ", "-")[:120] or str(current.get("slug") or _new_id("n_"))
     next_slug = await _ensure_unique_slug(db, table="Novel", slug=slug_base, current_id=novel_id)
 
-    use_series_name = payload.seriesName is not None and str(payload.seriesName).strip() != ""
+    use_series_name = parsed.seriesName is not None and str(parsed.seriesName).strip() != ""
     if use_series_name:
-        next_series_id = await _resolve_series_id(db, series_id=None, series_name=payload.seriesName)
-    elif payload.seriesId is not None:
-        next_series_id = await _resolve_series_id(db, series_id=payload.seriesId, series_name=None)
+        next_series_id = await _resolve_series_id(db, series_id=None, series_name=parsed.seriesName)
+    elif parsed.seriesId is not None:
+        next_series_id = await _resolve_series_id(db, series_id=parsed.seriesId, series_name=None)
     else:
         next_series_id = current.get("seriesId")
 
@@ -1202,19 +1203,19 @@ async def mod_update_novel(
                 "title": next_title,
                 "slug": next_slug,
                 "author_name": next_author or None,
-                "original_title": (payload.originalTitle or "").strip() or None,
-                "original_author": (payload.originalAuthorName or "").strip() or None,
-                "description": (payload.description or "").strip(),
-                "cover_url": (payload.coverUrl or "").strip() or None,
-                "status": (payload.status or "").strip() or None,
+                "original_title": (parsed.originalTitle or "").strip() or None,
+                "original_author": (parsed.originalAuthorName or "").strip() or None,
+                "description": (parsed.description or "").strip(),
+                "cover_url": (parsed.coverUrl or "").strip() or None,
+                "status": (parsed.status or "").strip() or None,
                 "series_id": next_series_id,
             },
         )
     ).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="Novel not found")
-    if payload.genreIds is not None:
-        await _set_novel_genres(db, novel_id, payload.genreIds)
+    if parsed.genreIds is not None:
+        await _set_novel_genres(db, novel_id, parsed.genreIds)
     await db.commit()
     return dict(row)
 
@@ -1735,13 +1736,14 @@ async def mod_create_chapter(
 
 @app.put("/api/mod/chuong")
 async def mod_update_chapter(
-    payload: ModChapterPayload,
+    payload: dict[str, Any] = Body(...),
     db: AsyncSession = Depends(get_db_session),
     user: dict = Depends(require_current_user),
 ):
     if user.get("role") not in ("MOD", "ADMIN"):
         raise HTTPException(status_code=403, detail="Forbidden")
-    chapter_id = str(payload.id or "").strip()
+    parsed = ModChapterPayload.model_validate(payload)
+    chapter_id = str(parsed.id or "").strip()
     if not chapter_id:
         raise HTTPException(status_code=400, detail="id is required")
     row = (
@@ -1754,9 +1756,9 @@ async def mod_update_chapter(
         raise HTTPException(status_code=404, detail="Chapter not found")
     await db.execute(
         text('UPDATE "ChapterMeta" SET number = :num, title = :title WHERE id = :id'),
-        {"id": chapter_id, "num": payload.number, "title": payload.title.strip()},
+        {"id": chapter_id, "num": parsed.number, "title": parsed.title.strip()},
     )
-    await _upsert_chapter_content(chapter_id, str(row["novelId"]), payload.number, payload.content, db)
+    await _upsert_chapter_content(chapter_id, str(row["novelId"]), parsed.number, parsed.content, db)
     await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": row["novelId"]})
     await db.commit()
     return {"id": chapter_id, "updated": True}
@@ -1817,28 +1819,39 @@ async def mod_bulk_delete_chapters(
 
 @app.put("/api/mod/chuong/optimize")
 async def mod_optimize_chapters(
-    payload: ModChapterOptimizePayload,
+    payload: dict[str, Any] = Body(...),
     db: AsyncSession = Depends(get_db_session),
     user: dict = Depends(require_current_user),
 ):
     if user.get("role") not in ("MOD", "ADMIN"):
         raise HTTPException(status_code=403, detail="Forbidden")
+    parsed = ModChapterOptimizePayload.model_validate(payload)
     modified = 0
-    for item in payload.updates:
+    renumbered: list[tuple[str, int, int]] = []
+    for item in parsed.updates:
         row = (
             await db.execute(
-                text('SELECT id FROM "ChapterMeta" WHERE id = :id AND "novelId" = :novel_id LIMIT 1'),
-                {"id": item.id, "novel_id": payload.novelId},
+                text('SELECT id, number FROM "ChapterMeta" WHERE id = :id AND "novelId" = :novel_id LIMIT 1'),
+                {"id": item.id, "novel_id": parsed.novelId},
             )
         ).mappings().first()
         if not row:
             continue
+        old_number = int(row.get("number") or 0)
         await db.execute(
             text('UPDATE "ChapterMeta" SET number = :number, title = :title WHERE id = :id'),
             {"id": item.id, "number": item.number, "title": item.title},
         )
+        if old_number > 0 and int(item.number) > 0 and old_number != int(item.number):
+            renumbered.append((str(item.id), old_number, int(item.number)))
         modified += 1
-    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": payload.novelId})
+
+    for chapter_id, old_number, new_number in renumbered:
+        content = await _resolve_chapter_content(chapter_id, db)
+        if content is None:
+            continue
+        await _upsert_chapter_content(chapter_id, parsed.novelId, new_number, content, db)
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": parsed.novelId})
     await db.commit()
     return {"modifiedCount": modified}
 
@@ -1970,8 +1983,12 @@ async def mod_epub_upload(
     splitMode: str | None = Form(default=None),
     chapterRegex: str | None = Form(default=None),
     title: str | None = Form(default=None),
+    originalTitle: str | None = Form(default=None),
     authorName: str | None = Form(default=None),
+    originalAuthorName: str | None = Form(default=None),
     description: str | None = Form(default=None),
+    genreIds: str | None = Form(default=None),
+    status: str | None = Form(default=None),
     seriesMode: str | None = Form(default=None),
     seriesId: str | None = Form(default=None),
     seriesName: str | None = Form(default=None),
@@ -1994,6 +2011,8 @@ async def mod_epub_upload(
     try:
         mode = "regex" if (splitMode or "").lower() == "regex" else "toc"
         pattern = (chapterRegex or "").strip() or None
+        source_sections = _extract_epub_chapters(tmp_path)
+        sections_after_filter = _filter_toc_chapters(source_sections) if mode == "toc" else source_sections
         chapters = _epub_extract_with_mode(tmp_path, mode, pattern)
         epub_meta = _extract_epub_metadata(tmp_path)
         inferred_title = str(epub_meta.get("title") or Path(file.filename or "novel").stem)
@@ -2002,8 +2021,12 @@ async def mod_epub_upload(
         inferred_genres = [str(g).strip() for g in (epub_meta.get("genres") or []) if str(g).strip()]
 
         base_title = " ".join((title or inferred_title).split()).strip() or "Untitled"
+        base_original_title = " ".join((originalTitle or "").split()).strip()
         base_author = " ".join((authorName or inferred_author).split()).strip() or "Unknown"
+        base_original_author = " ".join((originalAuthorName or "").split()).strip()
         base_desc = (description if description is not None else inferred_desc).strip()
+        base_status = " ".join((status or "Đang ra").split()).strip() or "Đang ra"
+        parsed_genre_ids = [g.strip() for g in str(genreIds or "").split(",") if g.strip()]
         cover_extracted = _extract_epub_cover(tmp_path) or _extract_epub_cover_from_zip(tmp_path)
         has_cover = bool(cover_extracted)
         cover_preview_data_url: str | None = None
@@ -2026,7 +2049,9 @@ async def mod_epub_upload(
                 "parserInfo": {
                     "splitMode": mode,
                     "chapterRegexUsed": pattern,
-                    "sourceSections": len(chapters),
+                    "sourceSections": len(source_sections),
+                    "sectionsAfterFilter": len(sections_after_filter),
+                    "sectionsDroppedByFilter": max(0, len(source_sections) - len(sections_after_filter)),
                     "chaptersDetected": len(chapters),
                     "chaptersFinal": len(chapters),
                     "insertedMissingChapters": len([c for c in chapters if c.get("is_placeholder")]),
@@ -2052,6 +2077,7 @@ async def mod_epub_upload(
                     }
                     for c in chapters[:30]
                 ],
+                "sample": _chapter_preview_samples(chapters, sample_size=10),
             }
 
         target_novel_id = str(appendTargetNovelId or "").strip()
@@ -2137,22 +2163,37 @@ async def mod_epub_upload(
                     "series_id": target_series_id,
                 },
             )
+            await db.execute(
+                text('UPDATE "Novel" SET "originalTitle" = :original_title, "originalAuthorName" = :original_author, status = :status, "updatedAt" = NOW() WHERE id = :id'),
+                {
+                    "id": novel_id,
+                    "original_title": base_original_title or None,
+                    "original_author": base_original_author or None,
+                    "status": base_status,
+                },
+            )
+            if parsed_genre_ids:
+                await _set_novel_genres(db, novel_id, parsed_genre_ids)
         else:
             novel_id = _new_id("n_")
             slug = await _ensure_unique_slug(db, table="Novel", slug=_norm_title(base_title).replace(" ", "-")[:120] or novel_id)
             await db.execute(
-                text('INSERT INTO "Novel" (id, title, slug, "authorName", description, "coverUrl", status, "seriesId", "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:desc,:cover,:status,:series_id,0,0,0,0,0,NOW(),NOW())'),
+                text('INSERT INTO "Novel" (id, title, slug, "authorName", "originalTitle", "originalAuthorName", description, "coverUrl", status, "seriesId", "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:original_title,:original_author,:desc,:cover,:status,:series_id,0,0,0,0,0,NOW(),NOW())'),
                 {
                     "id": novel_id,
                     "title": base_title,
                     "slug": slug,
                     "author": base_author,
+                    "original_title": base_original_title or None,
+                    "original_author": base_original_author or None,
                     "desc": base_desc,
                     "cover": uploaded_cover_url,
-                    "status": "Đang ra",
+                    "status": base_status,
                     "series_id": target_series_id,
                 },
             )
+            if parsed_genre_ids:
+                await _set_novel_genres(db, novel_id, parsed_genre_ids)
 
         for ch in chapters:
             num = int(ch.get("number") or 0)
@@ -2915,10 +2956,6 @@ def _is_toc_or_intro(chapter: dict[str, Any]) -> bool:
     if any(token in combined for token in intro_markers):
         return True
 
-    # Very short non-chapter sections are likely front/back matter.
-    if len(str(chapter.get("txt") or "").strip()) < 300:
-        return True
-
     return False
 
 
@@ -3023,7 +3060,7 @@ def _epub_extract_with_mode(epub_path: Path, split_mode: str, chapter_start_patt
             return _normalize_chapter_sequence(_extract_epub_chapters_by_regex(epub_path, effective_pattern))
         except re.error as exc:
             raise HTTPException(status_code=400, detail=f"Invalid chapterStartPattern: {exc}") from exc
-    return _normalize_chapter_sequence(_filter_toc_chapters(_extract_epub_chapters(epub_path)))
+    return _normalize_chapter_sequence(_extract_epub_chapters(epub_path))
 
 
 async def _ensure_genre_ids(db: AsyncSession, names: list[str]) -> list[str]:
@@ -3884,6 +3921,8 @@ async def mod_epub_ai_suggest(
     try:
         mode = "regex" if (splitMode or "").lower() == "regex" else "toc"
         pattern = (chapterRegex or "").strip() or None
+        source_sections = _extract_epub_chapters(tmp_path)
+        sections_after_filter = _filter_toc_chapters(source_sections) if mode == "toc" else source_sections
         chapters = _epub_extract_with_mode(tmp_path, mode, pattern)
         meta = _extract_epub_metadata(tmp_path)
         resolved_title = " ".join((title or str(meta.get("title") or tmp_path.stem)).split()).strip() or tmp_path.stem
