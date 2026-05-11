@@ -161,7 +161,7 @@ model Comment {
   content   String   @db.Text
   userId    String
   novelId   String
-  chapterId String?  // Có thể bình luận riêng tư cho từng chương (Lưu chapterId từ MongoDB)
+  chapterId String?  // Bình luận theo chương (id chương từ backend / ChapterMeta)
   
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   novel     Novel    @relation(fields: [novelId], references: [id], onDelete: Cascade)

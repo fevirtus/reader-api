@@ -8,7 +8,7 @@ Tai lieu nay mo ta `reader-api` la backend dung chung cho Web (`reader`) va Andr
   - API contract
   - domain rule
   - auth mapping web/mobile
-  - data orchestration PostgreSQL + MongoDB
+  - data orchestration: PostgreSQL + file/NAS chapter storage (khong con MongoDB)
 - Moi thay doi contract phai uu tien backward-compatible cho 2 client.
 
 ## Domain ownership
@@ -20,10 +20,9 @@ Tai lieu nay mo ta `reader-api` la backend dung chung cho Web (`reader`) va Andr
 ## Data strategy
 
 - PostgreSQL:
-  - user, novel metadata, genres, comments, ratings, bookmarks, progress.
-- MongoDB:
-  - chapter text content lon.
-  - recommendation document payload (neu can rich document).
+  - user, novel metadata, genres, comments, ratings, bookmarks, progress, chapter metadata (`ChapterMeta`), refs noi dung (`ChapterContentRef`).
+- Chapter body:
+  - file/NAS (qua `app.storage`) — txt/html theo href trong `ChapterContentRef`.
 
 ## Auth and identity
 
@@ -44,3 +43,7 @@ Tai lieu nay mo ta `reader-api` la backend dung chung cho Web (`reader`) va Andr
 - Da verify voi web + mobile happy path va auth edge cases.
 - Healthcheck va monitoring khong bi anh huong.
 - Docker/local dev van chay voi huong dan README.
+
+## Import (MOD)
+
+Chi con endpoint import preview `POST /api/import/uploads/preview` va nhom `/api/mod/epub*`. Cac endpoint SourceAsset/job legacy da go khoi service.

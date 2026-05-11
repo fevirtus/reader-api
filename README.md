@@ -11,7 +11,7 @@ This project is Python-first (FastAPI), with production-focused Docker setup and
 - Python 3.11+
 - FastAPI
 - UV (package manager / runner)
-- PostgreSQL (structured data)
+- PostgreSQL (metadata, user data, chapter refs; chapter text stored via NAS/files — see `NAS_CONTENT_ROOT` / storage layer)
 
 ## API Base URL
 
@@ -133,47 +133,40 @@ volumes:
 
 For your EPUB structure (folder per novel, multiple `.epub` parts inside), mount the parent folder to `/data/epub-source`.
 
-## Implemented Endpoints
+## Implemented Endpoints (snapshot)
 
-- GET /api/health
-- POST /api/auth/mobile-login
-- GET /api/user/profile
-- GET/POST /api/user/bookmarks
-- DELETE /api/user/bookmarks/{novelId}
-- POST /api/user/reading-progress
-- GET/POST /api/user/settings
-- GET/POST/DELETE /api/user/recommendations
-- GET /api/genres
-- GET /api/novels/browse
-- GET /api/novels/{idOrSlug}
-- GET /api/truyen/{id}/chapters
-- GET/POST /api/truyen/{id}/comments
-- POST /api/truyen/{id}/rate
-- GET /api/truyen/suggest
-- GET /api/chapters/{chapterId}
-- GET /api/import/assets/search
-- GET /api/import/assets/{assetId}/preview-metadata
-- POST /api/import/assets/{assetId}/ai-suggest
-- POST /api/import/assets/{assetId}/review
-- POST /api/import/assets/{assetId}/parse-preview
-- POST /api/import/assets/{assetId}/start-import
-- GET /api/import/sessions/{sessionId}
+**Public / user**
 
-## Simple EPUB Import Flow (Review-first)
+- `GET /api/health`
+- `GET /api/genres`, `GET /api/genres/{slug}`
+- `GET /api/novels/browse`, `GET /api/novels/{idOrSlug}`
+- `GET /api/truyen` (query `slug`), `GET /api/truyen/{novel_id}/chapters`, `GET /api/truyen/{novel_id}/chapters/by-number/{n}`
+- `GET /api/chapters/{chapter_id}`
+- `GET /api/truyen/suggest`
+- `GET/POST /api/truyen/{novel_id}/comments`, `POST /api/truyen/{novel_id}/rate`
 
-MOD/ADMIN flow on new import wizard:
+**Auth**
 
-1. Search source EPUB by name (DB index): `GET /api/import/assets/search`
-2. Review/edit metadata: `GET /api/import/assets/{id}/preview-metadata` + `POST /api/import/assets/{id}/review`
-3. Preview chapter split (TOC or regex-start): `POST /api/import/assets/{id}/parse-preview`
-4. Start import and poll progress:
-   - `POST /api/import/assets/{id}/start-import`
-   - `GET /api/import/sessions/{sessionId}`
+- `POST /api/auth/mobile-login` (JWT cho mobile)
+- `GET /api/auth/session` (session bridge cho web — xem handler trong `main.py`)
 
-AI assist in step 2:
-- `POST /api/import/assets/{id}/ai-suggest`
-- Returns up to 6 genres + 1 short description.
-- New genres are allowed and created immediately on apply.
+**User (login)**
+
+- `GET /api/user/profile`
+- `GET/POST /api/user/bookmarks`, `DELETE /api/user/bookmarks/{novel_id}`
+- `POST /api/user/reading-progress`
+- `GET/POST /api/user/settings`
+- `GET/POST/DELETE /api/user/recommendations`
+
+**MOD / ADMIN** — prefix `/api/mod/*` (thể loại, truyện, chương, overview, đề cử, upload bìa, EPUB…). Liệt kê đầy đủ trong `app/main.py`.
+
+**Import (MOD — web)**
+
+- `POST /api/import/uploads/preview` — upload EPUB multipart để lấy preview metadata/cover gợi ý.
+- `POST /api/mod/epub`, `POST /api/mod/epub/ai-suggest` — luồng import EPUB chính.
+- `GET/POST/PUT/DELETE /api/mod/the-loai` — quản lý thể loại trong wizard.
+
+Luồng SourceAsset / `/api/import/assets/*` và job pipeline cũ đã **gỡ khỏi codebase** (không còn endpoint).
 
 ## NAS Migration Ops
 
@@ -201,12 +194,6 @@ Checkpoint/resume mode:
 
 ```bash
 python scripts/backfill_chapter_content_refs.py --limit 1000 --state-file .backfill_state.json
-```
-
-Or continue from a known ObjectId:
-
-```bash
-python scripts/backfill_chapter_content_refs.py --limit 1000 --after-id 680f7f3a2f0d53f4f2b7a123
 ```
 
 ## Chapter Read Cutover Flag

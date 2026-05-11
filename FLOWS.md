@@ -39,20 +39,13 @@ Backend flow theo domain, de web/mobile follow giong nhau.
 
 ## Flow E: EPUB Import (MOD/ADMIN)
 
-- Step 1 search source:
-  - `/api/import/assets/search`
-- Step 2 review metadata:
-  - `/api/import/assets/{id}/preview-metadata`
-  - `/api/import/assets/{id}/ai-suggest`
-  - `/api/import/assets/{id}/review`
-- Step 3 chapter split preview:
-  - `/api/import/assets/{id}/parse-preview`
-  - split mode: `toc` or `regex` (chapter-start pattern only)
-- Step 4 start import + progress:
-  - `/api/import/assets/{id}/start-import`
-  - `/api/import/sessions/{sessionId}`
+Luồng trên web (`reader` `/mod/import`):
+
+- Thể loại: `GET/POST/PUT/DELETE /api/mod/the-loai`
+- Upload EPUB preview: `POST /api/import/uploads/preview` (multipart)
+- Gợi ý metadata: `POST /api/mod/epub/ai-suggest`
+- Import EPUB: `POST /api/mod/epub`
 
 Rules:
-- No filesystem scan in search request path (scan by cron/incremental).
-- Reviewer confirms metadata before import.
-- Import writes NAS content + chapter refs, then updates novel counters.
+
+- Import ghi nội dung NAS / refs chương và cập nhật metadata novel khi hoàn tất.

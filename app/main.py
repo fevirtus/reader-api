@@ -35,6 +35,9 @@ from app.config import settings
 from app.database import get_db_session
 from app.storage import storage
 
+# Giới hạn an toàn khi tách chương EPUB (đồng bộ với batch import trên web).
+MOD_EPUB_MAX_CHAPTERS = 4000
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -48,59 +51,6 @@ async def _ensure_migration_tables() -> None:
 
     ddl_statements = [
         'CREATE EXTENSION IF NOT EXISTS unaccent',
-        '''
-        CREATE TABLE IF NOT EXISTS "SourceAsset" (
-            id TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            sha256 TEXT NOT NULL,
-            opf_identifier TEXT,
-            title TEXT,
-            author TEXT,
-            status TEXT NOT NULL DEFAULT 'discovered',
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        ''',
-        '''
-        CREATE UNIQUE INDEX IF NOT EXISTS "SourceAsset_sha256_key" ON "SourceAsset"(sha256)
-        ''',
-        '''
-        ALTER TABLE "SourceAsset"
-            ADD COLUMN IF NOT EXISTS search_name TEXT,
-            ADD COLUMN IF NOT EXISTS size_bytes BIGINT,
-            ADD COLUMN IF NOT EXISTS mtime_epoch BIGINT,
-            ADD COLUMN IF NOT EXISTS "lastScannedAt" TIMESTAMPTZ,
-            ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'discovered',
-            ADD COLUMN IF NOT EXISTS review_payload JSONB
-        ''',
-        '''
-        CREATE INDEX IF NOT EXISTS "SourceAsset_search_name_idx" ON "SourceAsset"(search_name)
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS "ImportSession" (
-            id TEXT PRIMARY KEY,
-            "sourceAssetId" TEXT NOT NULL REFERENCES "SourceAsset"(id) ON DELETE CASCADE,
-            "novelId" TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            phase TEXT NOT NULL DEFAULT 'prepare',
-            "progressPct" DOUBLE PRECISION NOT NULL DEFAULT 0,
-            log TEXT,
-            "resultJson" JSONB,
-            "createdBy" TEXT,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS "ImportJob" (
-            id TEXT PRIMARY KEY,
-            "sourceAssetId" TEXT NOT NULL REFERENCES "SourceAsset"(id) ON DELETE CASCADE,
-            status TEXT NOT NULL DEFAULT 'pending',
-            error TEXT,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        ''',
         '''
         CREATE TABLE IF NOT EXISTS "ChapterContentRef" (
             "chapterId" TEXT PRIMARY KEY,
@@ -120,30 +70,6 @@ async def _ensure_migration_tables() -> None:
             views INT NOT NULL DEFAULT 0,
             "createdAt" TIMESTAMPTZ,
             UNIQUE("novelId", number)
-        )
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS "ImportCandidateChapter" (
-            id TEXT PRIMARY KEY,
-            "jobId" TEXT NOT NULL,
-            "candidateNumber" INT NOT NULL,
-            "candidateTitle" TEXT,
-            "candidateHash" TEXT,
-            "matchedChapterId" TEXT,
-            action TEXT NOT NULL,
-            reason TEXT,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS "AssetNovelMapping" (
-            id TEXT PRIMARY KEY,
-            "sourceAssetId" TEXT NOT NULL REFERENCES "SourceAsset"(id) ON DELETE CASCADE,
-            "novelId" TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            note TEXT,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         ''',
         '''
@@ -187,25 +113,6 @@ async def _ensure_migration_tables() -> None:
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
-@app.middleware("http")
-async def disable_legacy_import_routes(request: Request, call_next):
-    path = request.url.path
-    if path.startswith("/api/import") and path != "/api/import/uploads/preview":
-        return Response(
-            content=json.dumps({"detail": "Legacy import endpoints are removed"}),
-            status_code=410,
-            media_type="application/json",
-        )
-    return await call_next(request)
-
-_IMPORT_TASKS: set[asyncio.Task[Any]] = set()
-
-
-def _normalized_search_name(value: str) -> str:
-    raw = (value or "").replace("\\", "/")
-    base = raw.split("/")[-1]
-    stem = base.rsplit(".", 1)[0]
-    return _norm_title(stem)
 
 
 app.add_middleware(
@@ -996,7 +903,7 @@ async def _delete_novel_by_id(db: AsyncSession, novel_id: str) -> bool:
                 storage.delete_href(txt_href)
             except Exception:
                 pass
-        if raw_href:
+        if raw_href and raw_href != txt_href:
             try:
                 storage.delete_href(raw_href)
             except Exception:
@@ -1056,6 +963,36 @@ async def mod_list_novels(
         }
         for r in rows
     ]
+
+
+@app.get("/api/mod/truyen/by-title")
+async def mod_novel_exists_by_title(
+    title: str = Query(..., min_length=1, max_length=500),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    """Dùng cho batch import: so khớp `lower(title)` giống logic import EPUB."""
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    norm = " ".join(str(title).split()).strip() or ""
+    if not norm:
+        return {"exists": False}
+    row = (
+        await db.execute(
+            text('SELECT id, title, slug FROM "Novel" WHERE lower(title) = :title LIMIT 1'),
+            {"title": norm.lower()},
+        )
+    ).mappings().first()
+    if not row:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "novel": {
+            "id": str(row["id"]),
+            "title": str(row.get("title") or ""),
+            "slug": str(row.get("slug") or ""),
+        },
+    }
 
 
 @app.get("/api/mod/truyen/{novel_id}")
@@ -1618,10 +1555,10 @@ async def mod_delete_recommendation(
 
 async def _upsert_chapter_content(chapter_id: str, novel_id: str, number: int, content: str, db: AsyncSession) -> None:
     txt_href = f"novel-{novel_id}/{number}.txt"
-    raw_href = f"novel-{novel_id}/{number}.raw.html"
     txt = str(content or "")
+    # Một file duy nhất trên NAS: nội dung đọc hiển thị qua txtHref; rawHtmlHref trùng href để tránh ghi đôi (NAS chậm).
     await asyncio.to_thread(storage.write_text, txt_href, txt)
-    await asyncio.to_thread(storage.write_text, raw_href, txt)
+    raw_href = txt_href
     h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
     await db.execute(
         text(
@@ -2027,6 +1964,54 @@ async def mod_epub_upload(
         base_desc = (description if description is not None else inferred_desc).strip()
         base_status = " ".join((status or "Đang ra").split()).strip() or "Đang ra"
         parsed_genre_ids = [g.strip() for g in str(genreIds or "").split(",") if g.strip()]
+
+        n_chapters = len(chapters)
+        if n_chapters > MOD_EPUB_MAX_CHAPTERS:
+            if str(preview or "").lower() == "true":
+                n_ch = n_chapters
+                return {
+                    "preview": True,
+                    "importBlocked": True,
+                    "importBlockedReason": (
+                        f"Vượt giới hạn {MOD_EPUB_MAX_CHAPTERS} chương sau khi tách "
+                        f"(phát hiện {n_ch} chương)."
+                    ),
+                    "fileName": file.filename or "upload.epub",
+                    "splitMode": mode,
+                    "detectedStructureType": "standard",
+                    "hasCoverFromEpub": False,
+                    "coverPreviewDataUrl": None,
+                    "parserInfo": {
+                        "splitMode": mode,
+                        "chapterRegexUsed": pattern,
+                        "sourceSections": len(source_sections),
+                        "sectionsAfterFilter": len(sections_after_filter),
+                        "sectionsDroppedByFilter": max(0, len(source_sections) - len(sections_after_filter)),
+                        "chaptersDetected": n_ch,
+                        "chaptersFinal": n_ch,
+                        "insertedMissingChapters": 0,
+                        "detectedMaxChapterNumber": 0,
+                        "detectedNumberAssignments": 0,
+                        "policySkippedHeavyScan": True,
+                    },
+                    "novel": {
+                        "title": base_title,
+                        "authorName": base_author,
+                        "description": base_desc,
+                        "detectedGenres": inferred_genres,
+                        "totalChapters": n_ch,
+                    },
+                    "chaptersPreview": [],
+                    "sample": [],
+                }
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Quá giới hạn {MOD_EPUB_MAX_CHAPTERS} chương sau khi tách "
+                    f"(hiện {n_chapters} chương)."
+                ),
+            )
+
         cover_extracted = _extract_epub_cover(tmp_path) or _extract_epub_cover_from_zip(tmp_path)
         has_cover = bool(cover_extracted)
         cover_preview_data_url: str | None = None
@@ -2660,75 +2645,6 @@ class ModGenrePayload(BaseModel):
 class ModGenreMergePayload(BaseModel):
     sourceId: str
     targetId: str
-
-
-class SourceAssetApprovePayload(BaseModel):
-    status: str = Field(pattern="^(approved|rejected|review_required)$")
-
-
-class ImportJobCreatePayload(BaseModel):
-    sourceAssetId: str
-
-
-class ImportJobApplyMappingPayload(BaseModel):
-    novelId: str
-    overwrite: bool = False
-
-
-class ImportJobManualMapPayload(BaseModel):
-    novelId: str
-    sourceChapterNumber: int = Field(ge=1)
-    targetChapterId: str
-    overwrite: bool = True
-
-
-class ImportJobCompletePayload(BaseModel):
-    force: bool = False
-
-
-class ImportApplyPayload(BaseModel):
-    novelId: str
-    replaceMode: str = "none"  # none | selected | range
-    selectedChapterNumbers: list[int] = []
-    rangeStart: int | None = None
-    rangeEnd: int | None = None
-
-
-class SourceAssetUpsertPayload(BaseModel):
-    path: str
-    sha256: str
-    opfIdentifier: str | None = None
-    title: str | None = None
-    author: str | None = None
-
-
-class SourceAssetReviewPayload(BaseModel):
-    title: str | None = None
-    author: str | None = None
-    shortDescription: str | None = None
-    genres: list[str] = []
-    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
-    chapterStartPattern: str | None = None
-    targetMode: str = Field(default="new", pattern="^(new|existing)$")
-    novelId: str | None = None
-    replaceExisting: bool = False
-
-
-class SourceAssetParsePreviewPayload(BaseModel):
-    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
-    chapterStartPattern: str | None = None
-
-
-class SourceAssetStartImportPayload(BaseModel):
-    replaceExisting: bool = False
-    forceNovelId: str | None = None
-    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
-    chapterStartPattern: str | None = None
-
-
-class SourceAssetAiSuggestPayload(BaseModel):
-    splitMode: str = Field(default="toc", pattern="^(toc|regex)$")
-    chapterStartPattern: str | None = None
 
 
 class ModNovelPayload(BaseModel):
@@ -3548,6 +3464,19 @@ def _map_genres_to_existing(candidates: list[str], existing_genres: list[str], *
 _ROUTER_MODEL_CACHE: dict[str, Any] = {"expires_at": 0.0, "models": []}
 
 
+def _normalize_vietnamese_novel_status(raw: str | None) -> str:
+    allowed = ("Đang ra", "Hoàn thành", "Tạm ngưng")
+    s = " ".join((raw or "").split()).strip()
+    if s in allowed:
+        return s
+    low = s.lower()
+    if any(k in low for k in ("hoàn", "full", "complete", "end", "kết thúc")):
+        return "Hoàn thành"
+    if any(k in low for k in ("tạm ngưng", "drop", "hiatus", "đình chỉ")):
+        return "Tạm ngưng"
+    return "Đang ra"
+
+
 async def _router_pick_models() -> list[str]:
     api_key = (settings.router_api_key or "").strip()
 
@@ -3616,15 +3545,18 @@ async def _router_ai_suggest(
 
     system_prompt = (
         "You are a Vietnamese fiction metadata assistant. "
-        "Return ONLY valid JSON (no markdown, no explanation) with exactly keys: genres, shortDescription, confidence. "
+        "Return ONLY valid JSON (no markdown, no explanation) with exactly keys: genres, shortDescription, confidence, status. "
         "genres must be an array of 1-6 concise Vietnamese labels. "
-        "Prefer selecting from existingGenres when semantically close; create new genres only when no close match exists. "
+        "You MAY invent NEW genre labels that are not listed in existingGenres when they fit the work better than any existing label; "
+        "still prefer existingGenres when there is a clear semantic match (synonym). "
         "Do not output duplicates, slug format, or punctuation-only variants. "
         "shortDescription must be 6-7 Vietnamese sentences, each sentence on a new line using newline characters. "
         "Match tone and diction to the likely genre and make it emotionally engaging to increase reader curiosity. "
         "No major spoilers, no quotes. "
         "confidence must be a number from 0 to 1. "
-        "If uncertain, use broader/common genres rather than inventing niche ones."
+        "status must be EXACTLY one of these Vietnamese strings: \"Đang ra\", \"Hoàn thành\", \"Tạm ngưng\". "
+        "Infer status from chapter samples and typical serialization cues (complete arc vs cliffhanger vs hiatus markers); "
+        "when unsure, use \"Đang ra\"."
     )
     user_prompt = {
         "title": title,
@@ -3635,6 +3567,7 @@ async def _router_ai_suggest(
             "maxGenres": 6,
             "allowNewGenres": True,
             "preferExistingGenres": True,
+            "allowCreatingNewGenreRecords": True,
             "language": "vi",
         },
     }
@@ -3645,7 +3578,7 @@ async def _router_ai_suggest(
             {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
         ],
         "temperature": 0.3,
-        "max_tokens": 500,
+        "max_tokens": 650,
         "response_format": {"type": "json_object"},
     }
 
@@ -3676,6 +3609,7 @@ async def _router_ai_suggest(
             raw_genres = [str(g).strip() for g in (parsed.get("genres") or []) if str(g).strip()][:6]
             genres = _map_genres_to_existing(raw_genres, existing_genres, limit=6)
             short_description = str(parsed.get("shortDescription") or "").strip()
+            novel_status = _normalize_vietnamese_novel_status(str(parsed.get("status") or "").strip())
             try:
                 confidence = float(parsed.get("confidence") or 0.0)
             except Exception:
@@ -3683,7 +3617,13 @@ async def _router_ai_suggest(
             confidence = max(0.0, min(1.0, confidence))
             if not short_description or not genres:
                 continue
-            return {"suggestedGenres": genres, "shortDescription": short_description, "confidence": confidence, "model": model_id}
+            return {
+                "suggestedGenres": genres,
+                "shortDescription": short_description,
+                "confidence": confidence,
+                "model": model_id,
+                "suggestedStatus": novel_status,
+            }
         except Exception:
             continue
     return None
@@ -3703,162 +3643,6 @@ async def _resolve_chapter_content(chapter_id: str, db: AsyncSession) -> str | N
         except Exception:
             return None
     return None
-
-
-@app.get("/api/import/assets")
-async def list_source_assets(
-    status: str | None = None,
-    unconvertedOnly: bool = Query(default=False),
-    q: str | None = None,
-    offset: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db_session),
-):
-    where_parts: list[str] = []
-    params: dict[str, Any] = {"limit": limit}
-    if status:
-        where_parts.append('s.status = :status')
-        params["status"] = status
-
-    if unconvertedOnly:
-        where_parts.append(
-            '(s.status <> :asset_completed_status AND NOT EXISTS (SELECT 1 FROM "ImportJob" j WHERE j."sourceAssetId" = s.id AND j.status = :completed_status))'
-        )
-        params["asset_completed_status"] = "completed"
-        params["completed_status"] = "completed"
-
-    if q and q.strip():
-        raw = q.strip().lower()
-        where_parts.append(
-            '(unaccent(lower(s.path)) ILIKE unaccent(:q_raw) OR lower(s.path) ILIKE :q_raw)'
-        )
-        params["q_raw"] = f"%{raw}%"
-
-    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    rows = (
-        await db.execute(
-            text(
-                f'SELECT id, path, sha256, opf_identifier, title, author, status, "createdAt", "updatedAt" '
-                f'FROM "SourceAsset" s {where_sql} ORDER BY s."updatedAt" DESC OFFSET :offset LIMIT :limit'
-            ),
-            {**params, "offset": offset},
-        )
-    ).mappings().all()
-    novels = (await db.execute(text('SELECT id, title FROM "Novel"'))).mappings().all()
-    out: list[dict[str, Any]] = []
-    normalized_query = _norm_title(q or "")
-    query_tokens = [t for t in normalized_query.split(" ") if t]
-    for r in rows:
-        item = dict(r)
-        base = (item.get("path") or "").split("/")[-1].rsplit(".", 1)[0]
-        normalized_path = _norm_title(str(item.get("path") or ""))
-        if query_tokens and not all(tok in normalized_path for tok in query_tokens):
-            continue
-        best = {"id": None, "score": 0.0}
-        for n in novels:
-            sc = _title_score(base, str(n.get("title") or ""))
-            if sc > best["score"]:
-                best = {"id": n.get("id"), "score": sc}
-        item["matchedNovelId"] = best["id"]
-        item["matchScore"] = round(best["score"], 4)
-        item["converted"] = best["score"] >= 0.9
-        if unconvertedOnly and item["converted"]:
-            continue
-        out.append(item)
-    return out
-
-
-@app.get("/api/import/assets/search")
-async def search_source_assets(
-    q: str,
-    page: int = Query(default=1, ge=1),
-    limit: int = Query(default=20, ge=1, le=100),
-    status: str | None = None,
-    db: AsyncSession = Depends(get_db_session),
-):
-    query = _normalized_search_name(q)
-    if len(query) < 2:
-        return {"items": [], "pagination": {"page": page, "limit": limit, "total": 0, "totalPages": 0}}
-
-    where = ['search_name IS NOT NULL']
-    params: dict[str, Any] = {
-        "q_prefix": f"{query}%",
-        "q_like": f"%{query}%",
-        "offset": (page - 1) * limit,
-        "limit": limit,
-    }
-    if status:
-        where.append('status = :status')
-        params["status"] = status
-
-    where_sql = " AND ".join(where)
-    total = (
-        await db.execute(
-            text(f'SELECT COUNT(*)::int FROM "SourceAsset" WHERE {where_sql} AND (search_name LIKE :q_prefix OR search_name ILIKE :q_like)'),
-            params,
-        )
-    ).scalar_one()
-    rows = (
-        await db.execute(
-            text(
-                f'SELECT id, path, title, author, status, "updatedAt" '
-                f'FROM "SourceAsset" '
-                f'WHERE {where_sql} AND (search_name LIKE :q_prefix OR search_name ILIKE :q_like) '
-                f'ORDER BY CASE WHEN search_name LIKE :q_prefix THEN 0 ELSE 1 END, "updatedAt" DESC '
-                f'OFFSET :offset LIMIT :limit'
-            ),
-            params,
-        )
-    ).mappings().all()
-
-    total_pages = max((total + limit - 1) // limit, 1) if total else 0
-    return {
-        "items": [dict(row) for row in rows],
-        "pagination": {"page": page, "limit": limit, "total": int(total), "totalPages": total_pages},
-    }
-
-
-@app.get("/api/import/assets/{asset_id}/preview-metadata")
-async def preview_source_asset_metadata(
-    asset_id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    row = (
-        await db.execute(
-            text(
-                'SELECT id, path, title, author, status, review_status, review_payload, sha256, "updatedAt" '
-                'FROM "SourceAsset" WHERE id = :id LIMIT 1'
-            ),
-            {"id": asset_id},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    path = str(row["path"])
-    base = path.split("/")[-1].rsplit(".", 1)[0]
-    source_path = _resolve_epub_source_path(path, str(row.get("sha256") or ""))
-    preview = _extract_epub_preview_payload(source_path) if source_path else None
-    return {
-        "asset": {**dict(row), "coverDetected": bool(preview and preview.get("coverFound"))},
-        "suggested": {
-            "title": (preview.get("title") if preview else None) or row.get("title") or base,
-            "author": (preview.get("author") if preview else None) or row.get("author") or "Unknown",
-            "shortDescription": (preview.get("description") if preview else None) or None,
-            "genres": (preview.get("genres") if preview else None) or [],
-        },
-        "debug": {
-            "sourcePathResolved": str(source_path) if source_path else None,
-            "sourcePathExists": bool(source_path and source_path.exists()),
-            "coverFound": bool(preview and preview.get("coverFound")),
-            "coverExt": preview.get("coverExt") if preview else None,
-            "titleFromEpub": preview.get("title") if preview else None,
-            "authorFromEpub": preview.get("author") if preview else None,
-        },
-    }
 
 
 @app.post("/api/import/uploads/preview")
@@ -3941,6 +3725,7 @@ async def mod_epub_ai_suggest(
                 "confidence": ai_result["confidence"],
                 "source": "router_dynamic",
                 "model": ai_result.get("model"),
+                "suggestedStatus": ai_result.get("suggestedStatus") or "Đang ra",
             }
 
         fallback_genres = _map_genres_to_existing(_build_ai_genre_suggestions(chapters), existing_genres, limit=6)
@@ -3950,1494 +3735,13 @@ async def mod_epub_ai_suggest(
             "shortDescription": fallback_desc,
             "confidence": 0.62,
             "source": "rule_based_fallback",
+            "suggestedStatus": "Đang ra",
         }
     finally:
         try:
             tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
-
-
-@app.get("/api/import/assets/{asset_id}/preview-cover")
-async def preview_source_asset_cover(
-    asset_id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    row = (
-        await db.execute(text('SELECT id, path, sha256 FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    source_path = _resolve_epub_source_path(str(row["path"]), str(row.get("sha256") or ""))
-    if not source_path:
-        raise HTTPException(status_code=400, detail="EPUB source file not found")
-    preview = _extract_epub_preview_payload(source_path)
-    cover_bytes = preview.get("coverBytes") if preview else None
-    if not cover_bytes:
-        raise HTTPException(status_code=404, detail="Cover not found in EPUB")
-    ext = str(preview.get("coverExt") or ".jpg")
-    media_type = _mime_from_extension(ext)
-    return Response(content=cover_bytes, media_type=media_type)
-
-
-@app.post("/api/import/assets/{asset_id}/upload-cover")
-async def upload_source_asset_cover(
-    asset_id: str,
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    row = (
-        await db.execute(text('SELECT id, review_payload FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="File cover rong")
-    ext = ".jpg"
-    ct = (file.content_type or "").lower()
-    if "png" in ct:
-        ext = ".png"
-    elif "webp" in ct:
-        ext = ".webp"
-    elif "jpeg" in ct or "jpg" in ct:
-        ext = ".jpg"
-
-    cover_url = _upload_cover_bytes_to_r2(content, ext, key_prefix=f"manual-cover-{asset_id}")
-    if not cover_url:
-        raise HTTPException(status_code=500, detail="Upload cover that bai")
-
-    review_payload = row.get("review_payload") or {}
-    if isinstance(review_payload, str):
-        try:
-            review_payload = json.loads(review_payload)
-        except Exception:
-            review_payload = {}
-    review_payload["manualCoverUrl"] = cover_url
-
-    await db.execute(
-        text('UPDATE "SourceAsset" SET review_payload = CAST(:review_payload AS jsonb), "updatedAt" = NOW() WHERE id = :id'),
-        {"id": asset_id, "review_payload": json.dumps(review_payload)},
-    )
-    await db.commit()
-
-    return {"assetId": asset_id, "coverUrl": cover_url, "uploaded": True}
-
-
-@app.post("/api/import/assets/{asset_id}/review")
-async def review_source_asset(
-    asset_id: str,
-    payload: SourceAssetReviewPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    if payload.targetMode == "existing" and not payload.novelId:
-        raise HTTPException(status_code=400, detail="novelId is required when targetMode=existing")
-
-    row = (
-        await db.execute(
-            text(
-                'UPDATE "SourceAsset" SET title = COALESCE(:title, title), author = COALESCE(:author, author), '
-                'review_status = :review_status, review_payload = CAST(:review_payload AS jsonb), status = :status, "updatedAt" = NOW() '
-                'WHERE id = :id RETURNING id, path, title, author, status, review_status, review_payload, "updatedAt"'
-            ),
-            {
-                "id": asset_id,
-                "title": payload.title,
-                "author": payload.author,
-                "review_status": "reviewed",
-                "review_payload": json.dumps(payload.model_dump()),
-                "status": "approved",
-            },
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-    await db.commit()
-    return dict(row)
-
-
-@app.post("/api/import/assets/{asset_id}/ai-suggest")
-async def ai_suggest_source_asset(
-    asset_id: str,
-    payload: SourceAssetAiSuggestPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    row = (
-        await db.execute(text('SELECT id, path, title, author FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    source_path = _resolve_epub_source_path(str(row["path"]))
-    if not source_path or not source_path.exists():
-        raise HTTPException(status_code=400, detail="EPUB source file not found")
-
-    chapters = _epub_extract_with_mode(source_path, payload.splitMode, payload.chapterStartPattern)
-    title = str(row.get("title") or source_path.stem)
-    author = str(row.get("author") or "Unknown")
-    existing_genres = [
-        str(r.get("name") or "")
-        for r in (await db.execute(text('SELECT name FROM "Genre" ORDER BY name ASC'))).mappings().all()
-        if str(r.get("name") or "").strip()
-    ]
-
-    ai_result = await _router_ai_suggest(title, author, chapters, existing_genres)
-    if ai_result:
-        return {
-            "assetId": asset_id,
-            "suggestedGenres": ai_result["suggestedGenres"][:6],
-            "shortDescription": ai_result["shortDescription"],
-            "confidence": ai_result["confidence"],
-            "source": "router_dynamic",
-            "model": ai_result.get("model"),
-            "existingGenresCount": len(existing_genres),
-        }
-
-    genres = _build_ai_genre_suggestions(chapters)
-    genres = _map_genres_to_existing(genres, existing_genres, limit=6)
-    description = _build_ai_description(title, author, chapters)
-    return {
-        "assetId": asset_id,
-        "suggestedGenres": genres[:6],
-        "shortDescription": description,
-        "confidence": 0.62,
-        "source": "rule_based_fallback",
-        "existingGenresCount": len(existing_genres),
-    }
-
-
-@app.post("/api/import/assets/{asset_id}/parse-preview")
-async def parse_preview_source_asset(
-    asset_id: str,
-    payload: SourceAssetParsePreviewPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    row = (
-        await db.execute(text('SELECT id, path FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-    source_path = _resolve_epub_source_path(str(row["path"]))
-    if not source_path or not source_path.exists():
-        raise HTTPException(status_code=400, detail="EPUB source file not found")
-
-    chapters = _epub_extract_with_mode(source_path, payload.splitMode, payload.chapterStartPattern)
-    return {
-        "assetId": asset_id,
-        "splitMode": payload.splitMode,
-        "chapterCount": len(chapters),
-        "sample": _chapter_preview_samples(chapters, sample_size=10),
-        "warnings": [] if len(chapters) >= 3 else ["chapter_count_too_low"],
-    }
-
-
-def _run_import_session_task(session_id: str) -> None:
-    from app.database import SessionLocal
-
-    async def _run() -> None:
-        db = SessionLocal()
-        try:
-            row = (
-                await db.execute(
-                    text(
-                        'SELECT s.id, s."sourceAssetId", s."novelId", s.status, a.path, a.review_payload, a.title, a.author '
-                        'FROM "ImportSession" s JOIN "SourceAsset" a ON a.id = s."sourceAssetId" WHERE s.id = :id LIMIT 1'
-                    ),
-                    {"id": session_id},
-                )
-            ).mappings().first()
-            if not row:
-                return
-
-            await db.execute(
-                text('UPDATE "ImportSession" SET status = :st, phase = :ph, "progressPct" = :pct, "updatedAt" = NOW() WHERE id = :id'),
-                {"id": session_id, "st": "processing", "ph": "prepare", "pct": 5.0},
-            )
-            await db.commit()
-
-            source_path = _resolve_epub_source_path(str(row["path"]))
-            if not source_path or not source_path.exists():
-                await db.execute(
-                    text('UPDATE "ImportSession" SET status = :st, phase = :ph, log = :log, "updatedAt" = NOW() WHERE id = :id'),
-                    {"id": session_id, "st": "failed", "ph": "prepare", "log": "EPUB source file not found"},
-                )
-                await db.commit()
-                return
-
-            review_payload = row.get("review_payload") or {}
-            if isinstance(review_payload, str):
-                try:
-                    review_payload = json.loads(review_payload)
-                except Exception:
-                    review_payload = {}
-
-            cover_url: str | None = str(review_payload.get("manualCoverUrl") or "").strip() or None
-            if not cover_url:
-                cover_extracted = _extract_epub_cover(source_path)
-                if cover_extracted:
-                    cover_bytes, cover_ext = cover_extracted
-                    cover_url = _upload_cover_to_r2(cover_bytes, cover_ext, source_asset_id=str(row["sourceAssetId"]))
-
-            split_mode = str(review_payload.get("splitMode") or "toc")
-            chapter_start_pattern = review_payload.get("chapterStartPattern")
-            target_mode = str(review_payload.get("targetMode") or "new")
-            replace_existing = bool(review_payload.get("replaceExisting") or False)
-
-            await db.execute(
-                text('UPDATE "ImportSession" SET phase = :ph, "progressPct" = :pct, "updatedAt" = NOW() WHERE id = :id'),
-                {"id": session_id, "ph": "parse", "pct": 20.0},
-            )
-            await db.commit()
-            await db.execute(
-                text('UPDATE "ImportSession" SET log = :log, "updatedAt" = NOW() WHERE id = :id'),
-                {"id": session_id, "log": "parsing epub"},
-            )
-            await db.commit()
-            chapters = await asyncio.wait_for(
-                asyncio.to_thread(_epub_extract_with_mode, source_path, split_mode, chapter_start_pattern),
-                timeout=180,
-            )
-
-            novel_id = row.get("novelId")
-            if not novel_id and target_mode == "existing":
-                novel_id = review_payload.get("novelId")
-            if novel_id:
-                novel_exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})).mappings().first()
-                if not novel_exists:
-                    raise RuntimeError("Target novel not found")
-            if not novel_id:
-                base_title = str(review_payload.get("title") or row.get("title") or source_path.stem)
-                slug = _norm_title(base_title).replace(" ", "-")[:120] or _new_id("n_")
-                existing_slug_row = (
-                    await db.execute(text('SELECT id FROM "Novel" WHERE slug = :slug LIMIT 1'), {"slug": slug})
-                ).mappings().first()
-                if existing_slug_row:
-                    slug = f"{slug}-{_new_id()[:8]}"
-                novel_id = _new_id("n_")
-                await db.execute(
-                    text('INSERT INTO "Novel" (id, title, slug, "authorName", description, "coverUrl", status, "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:desc,:cover_url,:status,0,0,0,0,0,NOW(),NOW())'),
-                    {
-                        "id": novel_id,
-                        "title": base_title,
-                        "slug": slug,
-                        "author": str(review_payload.get("author") or row.get("author") or "Unknown"),
-                        "desc": str(review_payload.get("shortDescription") or ""),
-                        "cover_url": cover_url,
-                        "status": "Đang ra",
-                    },
-                )
-            elif cover_url:
-                await db.execute(
-                    text('UPDATE "Novel" SET "coverUrl" = COALESCE("coverUrl", :cover_url), "updatedAt" = NOW() WHERE id = :id'),
-                    {"id": novel_id, "cover_url": cover_url},
-                )
-
-            genres = [str(g) for g in (review_payload.get("genres") or [])]
-            if genres:
-                genre_ids = await _ensure_genre_ids(db, genres)
-                for gid in genre_ids:
-                    await db.execute(
-                        text('INSERT INTO "NovelGenre" ("novelId", "genreId") VALUES (:novel_id, :genre_id) ON CONFLICT DO NOTHING'),
-                        {"novel_id": novel_id, "genre_id": gid},
-                    )
-
-            await db.execute(
-                text('UPDATE "ImportSession" SET phase = :ph, "progressPct" = :pct, "novelId" = :novel_id, "updatedAt" = NOW() WHERE id = :id'),
-                {"id": session_id, "ph": "write_nas", "pct": 50.0, "novel_id": novel_id},
-            )
-            await db.commit()
-
-            added = 0
-            replaced = 0
-            skipped = 0
-            failed = 0
-            last_error: str | None = None
-            asset_id = str(row["sourceAssetId"])
-            total_chapters = max(1, len(chapters))
-            await db.execute(
-                text('UPDATE "ImportSession" SET phase = :ph, log = :log, "updatedAt" = NOW() WHERE id = :id'),
-                {"id": session_id, "ph": "write_nas", "log": f"writing chapters 0/{total_chapters}"},
-            )
-            await db.commit()
-
-            async def _write_storage_text(href: str, content: str) -> None:
-                await asyncio.wait_for(asyncio.to_thread(storage.write_text, href, content), timeout=20)
-
-            for idx, ch in enumerate(chapters, start=1):
-                processed_this = False
-                try:
-                    async with db.begin_nested():
-                        num = int(ch.get("number") or 0)
-                        if num <= 0:
-                            failed += 1
-                            continue
-                        is_placeholder = bool(ch.get("is_placeholder") or False)
-                        existing = (
-                            await db.execute(
-                                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :num LIMIT 1'),
-                                {"novel_id": novel_id, "num": num},
-                            )
-                        ).mappings().first()
-
-                        if existing:
-                            if replace_existing:
-                                await db.execute(text('UPDATE "ChapterMeta" SET title = :title WHERE id = :id'), {"id": existing["id"], "title": str(ch.get("title") or f"Chapter {num}")})
-                                if not is_placeholder:
-                                    txt_href = f"{asset_id}/{num}.txt"
-                                    raw_href = f"{asset_id}/{num}.raw.html"
-                                    txt = str(ch.get("txt") or "")
-                                    await _write_storage_text(txt_href, txt)
-                                    await _write_storage_text(raw_href, str(ch.get("raw_html") or ""))
-                                    h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
-                                    await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId","txtHref","rawHtmlHref","contentHash") VALUES (:id,:txt,:raw,:hash) ON CONFLICT ("chapterId") DO UPDATE SET "txtHref"=EXCLUDED."txtHref", "rawHtmlHref"=EXCLUDED."rawHtmlHref", "contentHash"=EXCLUDED."contentHash", "updatedAt"=NOW()'), {"id": existing["id"], "txt": txt_href, "raw": raw_href, "hash": h})
-                                else:
-                                    await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" = :id'), {"id": existing["id"]})
-                                replaced += 1
-                                processed_this = True
-                            else:
-                                skipped += 1
-                                processed_this = True
-                            continue
-
-                        cid = _new_id("cmeta_")
-                        await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": novel_id, "num": num, "title": str(ch.get("title") or f"Chapter {num}")})
-                        if not is_placeholder:
-                            txt_href = f"{asset_id}/{num}.txt"
-                            raw_href = f"{asset_id}/{num}.raw.html"
-                            txt = str(ch.get("txt") or "")
-                            await _write_storage_text(txt_href, txt)
-                            await _write_storage_text(raw_href, str(ch.get("raw_html") or ""))
-                            h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
-                            await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId","txtHref","rawHtmlHref","contentHash") VALUES (:id,:txt,:raw,:hash)'), {"id": cid, "txt": txt_href, "raw": raw_href, "hash": h})
-                        added += 1
-                        processed_this = True
-                except Exception as exc:
-                    failed += 1
-                    processed_this = True
-                    if last_error is None:
-                        last_error = str(exc)
-
-                if not processed_this:
-                    skipped += 1
-                    processed_this = True
-
-                if idx % 10 == 0 or idx == total_chapters:
-                    progress = 50.0 + (float(idx) / float(total_chapters)) * 45.0
-                    processed = added + replaced + skipped + failed
-                    await db.execute(
-                        text('UPDATE "ImportSession" SET "progressPct" = :pct, log = :log, "updatedAt" = NOW() WHERE id = :id'),
-                        {"id": session_id, "pct": min(progress, 95.0), "log": f"writing chapters {processed}/{total_chapters}"},
-                    )
-                    await db.commit()
-
-            await db.execute(text('UPDATE "Novel" SET description = COALESCE(:desc, description), "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": novel_id, "desc": review_payload.get("shortDescription")})
-            await db.execute(
-                text('UPDATE "ImportSession" SET status = :st, phase = :ph, "progressPct" = :pct, "resultJson" = CAST(:result AS jsonb), "updatedAt" = NOW() WHERE id = :id'),
-                {
-                    "id": session_id,
-                    "st": "completed",
-                    "ph": "finalize",
-                    "pct": 100.0,
-                    "result": json.dumps({"parsed": len(chapters), "added": added, "replaced": replaced, "skipped": skipped, "failed": failed, "novelId": novel_id, "lastError": last_error}),
-                },
-            )
-            await db.execute(
-                text('UPDATE "SourceAsset" SET status = :status, review_status = :review_status, "updatedAt" = NOW() WHERE id = :id'),
-                {"id": row["sourceAssetId"], "status": "completed" if failed == 0 else "review_required", "review_status": "imported" if failed == 0 else "reviewed"},
-            )
-            await db.commit()
-        except Exception as exc:
-            try:
-                await db.rollback()
-                await db.execute(
-                    text('UPDATE "ImportSession" SET status = :st, log = :log, "updatedAt" = NOW() WHERE id = :id'),
-                    {"id": session_id, "st": "failed", "log": str(exc)},
-                )
-                await db.commit()
-            except Exception:
-                pass
-        finally:
-            await db.close()
-
-    return _run()
-
-
-@app.post("/api/import/assets/{asset_id}/start-import")
-async def start_import_source_asset(
-    asset_id: str,
-    payload: SourceAssetStartImportPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    asset = (
-        await db.execute(text('SELECT id, status, review_payload FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": asset_id})
-    ).mappings().first()
-    if not asset:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    review_payload = asset.get("review_payload") or {}
-    if isinstance(review_payload, str):
-        try:
-            review_payload = json.loads(review_payload)
-        except Exception:
-            review_payload = {}
-    review_payload["replaceExisting"] = bool(payload.replaceExisting)
-    review_payload["splitMode"] = payload.splitMode
-    review_payload["chapterStartPattern"] = payload.chapterStartPattern
-
-    await db.execute(
-        text('UPDATE "SourceAsset" SET review_payload = CAST(:review_payload AS jsonb), "updatedAt" = NOW() WHERE id = :id'),
-        {"id": asset_id, "review_payload": json.dumps(review_payload)},
-    )
-
-    session_id = _new_id("is_")
-    await db.execute(
-        text(
-            'INSERT INTO "ImportSession" (id, "sourceAssetId", "novelId", status, phase, "progressPct", log, "resultJson", "createdBy") '
-            'VALUES (:id, :asset, :novel, :status, :phase, :pct, :log, :result, :created_by)'
-        ),
-        {
-            "id": session_id,
-            "asset": asset_id,
-            "novel": payload.forceNovelId,
-            "status": "pending",
-            "phase": "prepare",
-            "pct": 0.0,
-            "log": None,
-            "result": None,
-            "created_by": str(user.get("id") or ""),
-        },
-    )
-    await db.commit()
-
-    task = asyncio.create_task(_run_import_session_task(session_id), name=f"import-session-{session_id}")
-    _IMPORT_TASKS.add(task)
-    task.add_done_callback(lambda t: _IMPORT_TASKS.discard(t))
-    return {"sessionId": session_id, "status": "pending", "phase": "prepare", "progressPct": 0}
-
-
-@app.get("/api/import/sessions/{session_id}")
-async def get_import_session(
-    session_id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    row = (
-        await db.execute(
-            text(
-                'SELECT id, "sourceAssetId", "novelId", status, phase, "progressPct", log, "resultJson", "createdAt", "updatedAt" '
-                'FROM "ImportSession" WHERE id = :id LIMIT 1'
-            ),
-            {"id": session_id},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Import session not found")
-    out = dict(row)
-    result = out.get("resultJson")
-    if isinstance(result, str):
-        try:
-            out["resultJson"] = json.loads(result)
-        except Exception:
-            out["resultJson"] = None
-    return out
-
-
-class ConvertAssetPayload(BaseModel):
-    assetId: str
-
-
-@app.post("/api/import/convert")
-async def convert_asset(
-    payload: ConvertAssetPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    asset = (
-        await db.execute(text('SELECT id, path FROM "SourceAsset" WHERE id = :id LIMIT 1'), {"id": payload.assetId})
-    ).mappings().first()
-    if not asset:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    base = str(asset.get("path") or "").split("/")[-1].rsplit(".", 1)[0]
-    novels = (await db.execute(text('SELECT id, title FROM "Novel"'))).mappings().all()
-    best = {"id": None, "score": 0.0}
-    for n in novels:
-        sc = _title_score(base, str(n.get("title") or ""))
-        if sc > best["score"]:
-            best = {"id": n.get("id"), "score": sc}
-    novel_id = best["id"]
-    if not novel_id:
-        novel_id = _new_id("n_")
-        slug = _norm_title(base).replace(" ", "-")[:120] or novel_id
-        await db.execute(
-            text('INSERT INTO "Novel" (id, title, slug, "authorName", description, status, "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:desc,:status,0,0,0,0,0,NOW(),NOW())'),
-            {"id": novel_id, "title": base, "slug": slug, "author": "Unknown", "desc": "", "status": "Đang ra"},
-        )
-
-    source_path = Path(settings.epub_source_root) / str(asset["path"])
-    if not source_path.exists():
-        raise HTTPException(status_code=400, detail="EPUB source file not found")
-    chapters = _extract_epub_chapters(source_path)
-    added = 0
-    for ch in chapters:
-        num = int(ch.get("number") or 0)
-        if num <= 0:
-            continue
-        existing = (await db.execute(text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :num LIMIT 1'), {"novel_id": novel_id, "num": num})).mappings().first()
-        if existing:
-            continue
-        cid = _new_id("c_")
-        txt_href = f"{payload.assetId}/{num}.txt"
-        raw_href = f"{payload.assetId}/{num}.raw.html"
-        txt = str(ch.get("txt") or "")
-        storage.write_text(txt_href, txt)
-        storage.write_text(raw_href, str(ch.get("raw_html") or ""))
-        h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
-        await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": novel_id, "num": num, "title": str(ch.get("title") or f"Chapter {num}")})
-        await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId","txtHref","rawHtmlHref","contentHash") VALUES (:id,:txt,:raw,:hash)'), {"id": cid, "txt": txt_href, "raw": raw_href, "hash": h})
-        added += 1
-    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": novel_id})
-    await db.commit()
-    return {"assetId": payload.assetId, "novelId": novel_id, "added": added, "done": True}
-
-
-@app.post("/api/import/assets/auto-review")
-async def auto_review_assets(
-    limit: int = Query(default=1000, ge=1, le=10000),
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    def normalize(v: str) -> str:
-        v = (v or "").strip().lower()
-        frm = "áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ"
-        to = "aaaaaaaaaaaaaaaaaeeeeeeeeeeeiiiiiooooooooooooooooouuuuuuuuuuuyyyyyd"
-        v = v.translate(str.maketrans(frm, to))
-        return "".join(ch for ch in v if ch.isalnum() or ch.isspace()).strip()
-
-    novel_rows = (
-        await db.execute(text('SELECT id, title, slug FROM "Novel"'))
-    ).mappings().all()
-    known = {normalize(str(r.get("title") or "")) for r in novel_rows}
-    known.update({normalize(str(r.get("slug") or "")) for r in novel_rows})
-
-    assets = (
-        await db.execute(
-            text('SELECT id, path, status FROM "SourceAsset" WHERE status IN (:d,:a,:r) ORDER BY "updatedAt" DESC LIMIT :limit'),
-            {"d": "discovered", "a": "approved", "r": "review_required", "limit": limit},
-        )
-    ).mappings().all()
-
-    approved = 0
-    review_required = 0
-    for a in assets:
-        path = str(a.get("path") or "")
-        base = path.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        folder = path.split("/", 1)[0] if "/" in path else base
-        key = normalize(base)
-        alt = normalize(folder)
-        status = "approved" if (key in known or alt in known) else "review_required"
-        await db.execute(
-            text('UPDATE "SourceAsset" SET status = :status, "updatedAt" = NOW() WHERE id = :id'),
-            {"id": a["id"], "status": status},
-        )
-        if status == "approved":
-            approved += 1
-        else:
-            review_required += 1
-
-    await db.commit()
-    return {"processed": len(assets), "approved": approved, "reviewRequired": review_required}
-
-
-@app.post("/api/import/assets/upsert")
-async def upsert_source_asset(
-    payload: SourceAssetUpsertPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    existing = (
-        await db.execute(text('SELECT id, path, sha256 FROM "SourceAsset" WHERE sha256 = :sha256 LIMIT 1'), {"sha256": payload.sha256})
-    ).mappings().first()
-
-    if existing:
-        row = (
-            await db.execute(
-                text(
-                    'UPDATE "SourceAsset" SET path = :path, opf_identifier = :opf, title = :title, author = :author, '
-                    '"updatedAt" = NOW() WHERE id = :id '
-                    'RETURNING id, path, sha256, status, "updatedAt"'
-                ),
-                {
-                    "id": existing["id"],
-                    "path": payload.path,
-                    "opf": payload.opfIdentifier,
-                    "title": payload.title,
-                    "author": payload.author,
-                },
-            )
-        ).mappings().first()
-    else:
-        new_id = _new_id("asset_")
-        row = (
-            await db.execute(
-                text(
-                    'INSERT INTO "SourceAsset" (id, path, sha256, opf_identifier, title, author, status) '
-                    'VALUES (:id, :path, :sha256, :opf, :title, :author, :status) '
-                    'RETURNING id, path, sha256, status, "updatedAt"'
-                ),
-                {
-                    "id": new_id,
-                    "path": payload.path,
-                    "sha256": payload.sha256,
-                    "opf": payload.opfIdentifier,
-                    "title": payload.title,
-                    "author": payload.author,
-                    "status": "discovered",
-                },
-            )
-        ).mappings().first()
-
-    await db.commit()
-    return dict(row) if row else {}
-
-
-@app.post("/api/import/assets/{asset_id}/approve")
-async def approve_source_asset(
-    asset_id: str,
-    payload: SourceAssetApprovePayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    row = (
-        await db.execute(
-            text(
-                'UPDATE "SourceAsset" SET status = :status, "updatedAt" = NOW() '
-                'WHERE id = :id RETURNING id, status, "updatedAt"'
-            ),
-            {"id": asset_id, "status": payload.status},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-    await db.commit()
-    return dict(row)
-
-
-@app.post("/api/import/assets/{asset_id}/mark-converted")
-async def mark_source_asset_converted(
-    asset_id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    row = (
-        await db.execute(
-            text('UPDATE "SourceAsset" SET status = :status, "updatedAt" = NOW() WHERE id = :id RETURNING id, status'),
-            {"id": asset_id, "status": "completed"},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    await db.execute(
-        text(
-            'INSERT INTO "ImportJob" (id, "sourceAssetId", status, error) '
-            'VALUES (:id, :asset_id, :status, :error)'
-        ),
-        {
-            "id": _new_id("job_"),
-            "asset_id": asset_id,
-            "status": "completed",
-            "error": "marked_converted_manually",
-        },
-    )
-    await db.commit()
-    return {"id": row["id"], "status": row["status"], "marked": True}
-
-
-@app.post("/api/import/assets/{asset_id}/unmark-converted")
-async def unmark_source_asset_converted(
-    asset_id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    row = (
-        await db.execute(
-            text('UPDATE "SourceAsset" SET status = :status, "updatedAt" = NOW() WHERE id = :id RETURNING id, status'),
-            {"id": asset_id, "status": "discovered"},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-
-    await db.execute(
-        text('DELETE FROM "ImportJob" WHERE "sourceAssetId" = :asset_id AND status = :status'),
-        {"asset_id": asset_id, "status": "completed"},
-    )
-    await db.commit()
-    return {"id": row["id"], "status": row["status"], "unmarked": True}
-
-
-@app.post("/api/import/jobs")
-async def create_import_job(
-    payload: ImportJobCreatePayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    source_row = (
-        await db.execute(
-            text('SELECT id, status FROM "SourceAsset" WHERE id = :id LIMIT 1'),
-            {"id": payload.sourceAssetId},
-        )
-    ).mappings().first()
-    if not source_row:
-        raise HTTPException(status_code=404, detail="Source asset not found")
-    if source_row["status"] != "approved":
-        raise HTTPException(status_code=400, detail="Source asset must be approved")
-
-    job_id = _new_id("job_")
-    await db.execute(
-        text('INSERT INTO "ImportJob" (id, "sourceAssetId", status) VALUES (:id, :asset_id, :status)'),
-        {"id": job_id, "asset_id": payload.sourceAssetId, "status": "pending"},
-    )
-    await db.commit()
-    return {"id": job_id, "sourceAssetId": payload.sourceAssetId, "status": "pending"}
-
-
-@app.get("/api/import/jobs/{job_id}")
-async def get_import_job(job_id: str, db: AsyncSession = Depends(get_db_session)):
-    row = (
-        await db.execute(
-            text(
-                'SELECT j.id, j."sourceAssetId", j.status, j.error, j."createdAt", j."updatedAt" '
-                'FROM "ImportJob" j WHERE j.id = :id LIMIT 1'
-            ),
-            {"id": job_id},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Import job not found")
-    return dict(row)
-
-
-@app.post("/api/import/jobs/{job_id}/run")
-async def run_import_job(
-    job_id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (
-        await db.execute(
-            text(
-                'SELECT j.id, j."sourceAssetId", s.path, s.status AS source_status '
-                'FROM "ImportJob" j JOIN "SourceAsset" s ON s.id = j."sourceAssetId" '
-                'WHERE j.id = :id LIMIT 1'
-            ),
-            {"id": job_id},
-        )
-    ).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    source_path = Path(settings.epub_source_root) / str(job["path"])
-    if not source_path.exists():
-        await db.execute(
-            text('UPDATE "ImportJob" SET status = :status, error = :err, "updatedAt" = NOW() WHERE id = :id'),
-            {"id": job_id, "status": "failed", "err": "EPUB file not found"},
-        )
-        await db.commit()
-        raise HTTPException(status_code=400, detail="EPUB source file not found")
-
-    await db.execute(
-        text('UPDATE "ImportJob" SET status = :status, error = NULL, "updatedAt" = NOW() WHERE id = :id'),
-        {"id": job_id, "status": "processing"},
-    )
-    await db.commit()
-
-    try:
-        chapters = _extract_epub_chapters(source_path)
-        if not chapters:
-            raise RuntimeError("No readable chapters extracted from EPUB")
-
-        for chapter in chapters:
-            base = f"{job['sourceAssetId']}/{chapter['number']}"
-            txt_write = storage.write_text(f"{base}.txt", chapter["txt"])
-            storage.write_text(f"{base}.raw.html", chapter["raw_html"])
-            # missing mapping to canonical chapter ids: keep in review_required queue
-
-        await db.execute(
-            text('UPDATE "ImportJob" SET status = :status, error = :err, "updatedAt" = NOW() WHERE id = :id'),
-            {
-                "id": job_id,
-                "status": "review_required",
-                "err": f"missing_mapping:{len(chapters)}_chapters_ready",
-            },
-        )
-        await db.commit()
-        return {"id": job_id, "status": "review_required", "chaptersExtracted": len(chapters)}
-    except Exception as exc:
-        await db.execute(
-            text('UPDATE "ImportJob" SET status = :status, error = :err, "updatedAt" = NOW() WHERE id = :id'),
-            {"id": job_id, "status": "failed", "err": str(exc)},
-        )
-        await db.commit()
-        raise HTTPException(status_code=500, detail="Import job failed") from exc
-
-
-@app.post("/api/import/jobs/{job_id}/preview")
-async def preview_import_job(
-    job_id: str,
-    payload: ImportApplyPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-    asset_id = str(job["sourceAssetId"])
-    asset_dir = Path(settings.nas_content_root) / asset_id
-    if not asset_dir.exists():
-        raise HTTPException(status_code=400, detail="Converted content folder not found")
-
-    await db.execute(text('DELETE FROM "ImportCandidateChapter" WHERE "jobId" = :job_id'), {"job_id": job_id})
-    created = 0
-    for txt_file in sorted(asset_dir.glob("*.txt")):
-        token = txt_file.stem
-        if not token.isdigit():
-            continue
-        num = int(token)
-        title = txt_file.with_suffix(".raw.html").name
-        chapter = (await db.execute(text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :num LIMIT 1'), {"novel_id": payload.novelId, "num": num})).mappings().first()
-        action = "add" if not chapter else "replace"
-        txt = storage.read_text(f"{asset_id}/{num}.txt")
-        h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
-        await db.execute(
-            text(
-                'INSERT INTO "ImportCandidateChapter" (id, "jobId", "candidateNumber", "candidateTitle", "candidateHash", "matchedChapterId", action, reason) '
-                'VALUES (:id,:job,:num,:title,:hash,:matched,:action,:reason)'
-            ),
-            {
-                "id": _new_id("ic_"),
-                "job": job_id,
-                "num": num,
-                "title": title,
-                "hash": h,
-                "matched": chapter["id"] if chapter else None,
-                "action": action,
-                "reason": "number_match" if chapter else "missing_in_novel",
-            },
-        )
-        created += 1
-    await db.commit()
-    return {"jobId": job_id, "novelId": payload.novelId, "candidates": created}
-
-
-@app.post("/api/import/jobs/{job_id}/apply")
-async def apply_import_job(
-    job_id: str,
-    payload: ImportApplyPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    job = (await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-    asset_id = str(job["sourceAssetId"])
-
-    rows = (await db.execute(text('SELECT id, "candidateNumber", "matchedChapterId", action FROM "ImportCandidateChapter" WHERE "jobId" = :job ORDER BY "candidateNumber"'), {"job": job_id})).mappings().all()
-    added = 0
-    replaced = 0
-    for r in rows:
-        num = int(r["candidateNumber"])
-        do_replace = False
-        if payload.replaceMode == "selected" and num in payload.selectedChapterNumbers:
-            do_replace = True
-        if payload.replaceMode == "range" and payload.rangeStart and payload.rangeEnd and payload.rangeStart <= num <= payload.rangeEnd:
-            do_replace = True
-        txt_href = f"{asset_id}/{num}.txt"
-        raw_href = f"{asset_id}/{num}.raw.html"
-        txt = storage.read_text(txt_href)
-        h = hashlib.sha256(txt.encode("utf-8")).hexdigest()
-        if r["matchedChapterId"] and do_replace:
-            await db.execute(text('UPDATE "ChapterMeta" SET title = :title WHERE id = :id'), {"id": r["matchedChapterId"], "title": f"Chapter {num}"})
-            await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") VALUES (:id,:txt,:raw,:hash) ON CONFLICT ("chapterId") DO UPDATE SET "txtHref"=EXCLUDED."txtHref", "rawHtmlHref"=EXCLUDED."rawHtmlHref", "contentHash"=EXCLUDED."contentHash", "updatedAt"=NOW()'), {"id": r["matchedChapterId"], "txt": txt_href, "raw": raw_href, "hash": h})
-            replaced += 1
-        elif not r["matchedChapterId"]:
-            cid = _new_id("cmeta_")
-            await db.execute(text('INSERT INTO "ChapterMeta" (id, "novelId", number, title, views, "createdAt") VALUES (:id,:novel,:num,:title,0,NOW())'), {"id": cid, "novel": payload.novelId, "num": num, "title": f"Chapter {num}"})
-            await db.execute(text('INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") VALUES (:id,:txt,:raw,:hash)'), {"id": cid, "txt": txt_href, "raw": raw_href, "hash": h})
-            added += 1
-    await db.commit()
-    return {"jobId": job_id, "added": added, "replaced": replaced}
-
-
-@app.post("/api/import/jobs/{job_id}/apply-mapping")
-async def apply_import_job_mapping(
-    job_id: str,
-    payload: ImportJobApplyMappingPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (
-        await db.execute(
-            text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'),
-            {"id": job_id},
-        )
-    ).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    asset_id = str(job["sourceAssetId"])
-    asset_dir = Path(settings.nas_content_root) / asset_id
-    if not asset_dir.exists():
-        raise HTTPException(status_code=400, detail="Converted content folder not found")
-
-    txt_files = sorted(asset_dir.glob("*.txt"))
-    mapped = 0
-    missing = 0
-
-    for txt_file in txt_files:
-        chapter_token = txt_file.stem
-        if not chapter_token.isdigit():
-            continue
-        chapter_number = int(chapter_token)
-        chapter = (
-            await db.execute(
-                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
-                {"novel_id": payload.novelId, "number": chapter_number},
-            )
-        ).mappings().first()
-        if not chapter:
-            missing += 1
-            continue
-
-        chapter_id = str(chapter.get("id"))
-        txt_href = f"{asset_id}/{chapter_number}.txt"
-        raw_href = f"{asset_id}/{chapter_number}.raw.html"
-        content_hash = hashlib.sha256(storage.read_text(txt_href).encode("utf-8")).hexdigest()
-
-        if payload.overwrite:
-            await db.execute(
-                text(
-                    'INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") '
-                    'VALUES (:chapter_id, :txt_href, :raw_href, :hash) '
-                    'ON CONFLICT ("chapterId") DO UPDATE '
-                    'SET "txtHref" = EXCLUDED."txtHref", "rawHtmlHref" = EXCLUDED."rawHtmlHref", '
-                    '"contentHash" = EXCLUDED."contentHash", "updatedAt" = NOW()'
-                ),
-                {
-                    "chapter_id": chapter_id,
-                    "txt_href": txt_href,
-                    "raw_href": raw_href,
-                    "hash": content_hash,
-                },
-            )
-        else:
-            await db.execute(
-                text(
-                    'INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") '
-                    'VALUES (:chapter_id, :txt_href, :raw_href, :hash) '
-                    'ON CONFLICT ("chapterId") DO NOTHING'
-                ),
-                {
-                    "chapter_id": chapter_id,
-                    "txt_href": txt_href,
-                    "raw_href": raw_href,
-                    "hash": content_hash,
-                },
-            )
-        mapped += 1
-
-    status = "completed" if missing == 0 else "review_required"
-    await db.execute(
-        text(
-            'INSERT INTO "AssetNovelMapping" (id, "sourceAssetId", "novelId", status, note) '
-            'VALUES (:id, :asset_id, :novel_id, :status, :note)'
-        ),
-        {
-            "id": _new_id("map_"),
-            "asset_id": asset_id,
-            "novel_id": payload.novelId,
-            "status": status,
-            "note": f"mapped={mapped},missing={missing}",
-        },
-    )
-    await db.execute(
-        text('UPDATE "ImportJob" SET status = :status, error = :err, "updatedAt" = NOW() WHERE id = :id'),
-        {
-            "id": job_id,
-            "status": status,
-            "err": None if missing == 0 else f"missing_mapping:{missing}",
-        },
-    )
-    await db.commit()
-
-    return {"jobId": job_id, "sourceAssetId": asset_id, "mapped": mapped, "missing": missing, "status": status}
-
-
-@app.get("/api/import/review-required")
-async def list_review_required_jobs(
-    limit: int = Query(default=100, ge=1, le=500),
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    rows = (
-        await db.execute(
-            text(
-                'SELECT j.id, j."sourceAssetId", j.status, j.error, j."updatedAt", s.path, s.title, s.author '
-                'FROM "ImportJob" j JOIN "SourceAsset" s ON s.id = j."sourceAssetId" '
-                'WHERE j.status = :status ORDER BY j."updatedAt" DESC LIMIT :limit'
-            ),
-            {"status": "review_required", "limit": limit},
-        )
-    ).mappings().all()
-    return [dict(r) for r in rows]
-
-
-@app.get("/api/import/jobs/{job_id}/missing-mappings")
-async def get_missing_mappings(
-    job_id: str,
-    novelId: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (
-        await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})
-    ).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    asset_id = str(job["sourceAssetId"])
-    asset_dir = Path(settings.nas_content_root) / asset_id
-    if not asset_dir.exists():
-        raise HTTPException(status_code=400, detail="Converted content folder not found")
-
-    missing: list[dict[str, Any]] = []
-    for txt_file in sorted(asset_dir.glob("*.txt")):
-        token = txt_file.stem
-        if not token.isdigit():
-            continue
-        chapter_number = int(token)
-        chapter = (
-            await db.execute(
-                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
-                {"novel_id": novelId, "number": chapter_number},
-            )
-        ).mappings().first()
-        if not chapter:
-            missing.append(
-                {
-                    "sourceChapterNumber": chapter_number,
-                    "txtHref": f"{asset_id}/{chapter_number}.txt",
-                    "rawHtmlHref": f"{asset_id}/{chapter_number}.raw.html",
-                }
-            )
-    return {"jobId": job_id, "sourceAssetId": asset_id, "novelId": novelId, "missing": missing}
-
-
-@app.post("/api/import/jobs/{job_id}/manual-map")
-async def manual_map_chapter(
-    job_id: str,
-    payload: ImportJobManualMapPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (
-        await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})
-    ).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    asset_id = str(job["sourceAssetId"])
-    txt_href = f"{asset_id}/{payload.sourceChapterNumber}.txt"
-    raw_href = f"{asset_id}/{payload.sourceChapterNumber}.raw.html"
-    try:
-        content = storage.read_text(txt_href)
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail="Source chapter content not found") from exc
-
-    target = (
-        await db.execute(
-            text('SELECT id FROM "ChapterMeta" WHERE id = :id AND "novelId" = :novel_id LIMIT 1'),
-            {"id": payload.targetChapterId, "novel_id": payload.novelId},
-        )
-    ).mappings().first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Target chapter not found for novel")
-
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    if payload.overwrite:
-        await db.execute(
-            text(
-                'INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") '
-                'VALUES (:chapter_id, :txt_href, :raw_href, :hash) '
-                'ON CONFLICT ("chapterId") DO UPDATE '
-                'SET "txtHref" = EXCLUDED."txtHref", "rawHtmlHref" = EXCLUDED."rawHtmlHref", '
-                '"contentHash" = EXCLUDED."contentHash", "updatedAt" = NOW()'
-            ),
-            {
-                "chapter_id": payload.targetChapterId,
-                "txt_href": txt_href,
-                "raw_href": raw_href,
-                "hash": content_hash,
-            },
-        )
-    else:
-        await db.execute(
-            text(
-                'INSERT INTO "ChapterContentRef" ("chapterId", "txtHref", "rawHtmlHref", "contentHash") '
-                'VALUES (:chapter_id, :txt_href, :raw_href, :hash) ON CONFLICT ("chapterId") DO NOTHING'
-            ),
-            {
-                "chapter_id": payload.targetChapterId,
-                "txt_href": txt_href,
-                "raw_href": raw_href,
-                "hash": content_hash,
-            },
-        )
-    await db.commit()
-    return {
-        "jobId": job_id,
-        "sourceAssetId": asset_id,
-        "sourceChapterNumber": payload.sourceChapterNumber,
-        "targetChapterId": payload.targetChapterId,
-        "status": "mapped",
-    }
-
-
-@app.get("/api/import/jobs/{job_id}/source-chapter-preview")
-async def preview_source_chapter(
-    job_id: str,
-    chapterNumber: int = Query(..., ge=1),
-    includeRawHtml: bool = Query(default=False),
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (
-        await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})
-    ).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    asset_id = str(job["sourceAssetId"])
-    txt_href = f"{asset_id}/{chapterNumber}.txt"
-    raw_href = f"{asset_id}/{chapterNumber}.raw.html"
-    try:
-        txt_content = storage.read_text(txt_href)
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail="Source chapter not found") from exc
-
-    response: dict[str, Any] = {
-        "jobId": job_id,
-        "sourceAssetId": asset_id,
-        "chapterNumber": chapterNumber,
-        "txtHref": txt_href,
-        "rawHtmlHref": raw_href,
-        "txt": txt_content,
-    }
-    if includeRawHtml:
-        try:
-            response["rawHtml"] = storage.read_text(raw_href)
-        except Exception:
-            response["rawHtml"] = None
-    return response
-
-
-@app.post("/api/import/jobs/{job_id}/complete")
-async def complete_import_job(
-    job_id: str,
-    payload: ImportJobCompletePayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    row = (
-        await db.execute(
-            text('SELECT id, "sourceAssetId", status FROM "ImportJob" WHERE id = :id LIMIT 1'),
-            {"id": job_id},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    if row["status"] not in ("review_required", "completed") and not payload.force:
-        raise HTTPException(status_code=400, detail="Job is not ready for completion")
-
-    await db.execute(
-        text('UPDATE "ImportJob" SET status = :status, error = NULL, "updatedAt" = NOW() WHERE id = :id'),
-        {"id": job_id, "status": "completed"},
-    )
-    await db.execute(
-        text(
-            'UPDATE "AssetNovelMapping" SET status = :status, "updatedAt" = NOW() '
-            'WHERE "sourceAssetId" = :asset_id AND status != :status'
-        ),
-        {"asset_id": row["sourceAssetId"], "status": "completed"},
-    )
-    await db.execute(
-        text('UPDATE "SourceAsset" SET status = :status, review_status = :review_status, "updatedAt" = NOW() WHERE id = :id'),
-        {"id": row["sourceAssetId"], "status": "completed", "review_status": "imported"},
-    )
-    await db.commit()
-    return {"jobId": job_id, "status": "completed", "sourceAssetId": row["sourceAssetId"]}
-
-
-@app.get("/api/import/jobs/{job_id}/mapping-progress")
-async def get_mapping_progress(
-    job_id: str,
-    novelId: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (
-        await db.execute(text('SELECT id, "sourceAssetId", status, error FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})
-    ).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    asset_id = str(job["sourceAssetId"])
-    asset_dir = Path(settings.nas_content_root) / asset_id
-    if not asset_dir.exists():
-        raise HTTPException(status_code=400, detail="Converted content folder not found")
-
-    total = 0
-    mapped = 0
-    missing_numbers: list[int] = []
-    for txt_file in sorted(asset_dir.glob("*.txt")):
-        token = txt_file.stem
-        if not token.isdigit():
-            continue
-        chapter_number = int(token)
-        total += 1
-        chapter = (
-            await db.execute(
-                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
-                {"novel_id": novelId, "number": chapter_number},
-            )
-        ).mappings().first()
-        if not chapter:
-            missing_numbers.append(chapter_number)
-            continue
-
-        chapter_id = str(chapter.get("id"))
-        ref = (
-            await db.execute(
-                text('SELECT "chapterId" FROM "ChapterContentRef" WHERE "chapterId" = :id LIMIT 1'),
-                {"id": chapter_id},
-            )
-        ).mappings().first()
-        if ref:
-            mapped += 1
-        else:
-            missing_numbers.append(chapter_number)
-
-    missing = max(total - mapped, 0)
-    percent = 100.0 if total == 0 else round((mapped / total) * 100, 2)
-    return {
-        "jobId": job_id,
-        "sourceAssetId": asset_id,
-        "novelId": novelId,
-        "jobStatus": job["status"],
-        "jobError": job.get("error"),
-        "totalSourceChapters": total,
-        "mappedChapters": mapped,
-        "missingChapters": missing,
-        "progressPercent": percent,
-        "missingChapterNumbers": missing_numbers,
-    }
-
-
-@app.post("/api/import/jobs/{job_id}/auto-complete")
-async def auto_complete_import_job(
-    job_id: str,
-    novelId: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    job = (
-        await db.execute(text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'), {"id": job_id})
-    ).mappings().first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    asset_id = str(job["sourceAssetId"])
-    asset_dir = Path(settings.nas_content_root) / asset_id
-    if not asset_dir.exists():
-        raise HTTPException(status_code=400, detail="Converted content folder not found")
-
-    total = 0
-    mapped = 0
-    for txt_file in sorted(asset_dir.glob("*.txt")):
-        token = txt_file.stem
-        if not token.isdigit():
-            continue
-        chapter_number = int(token)
-        total += 1
-        chapter = (
-            await db.execute(
-                text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number = :number LIMIT 1'),
-                {"novel_id": novelId, "number": chapter_number},
-            )
-        ).mappings().first()
-        if not chapter:
-            continue
-        chapter_id = str(chapter.get("id"))
-        ref = (
-            await db.execute(
-                text('SELECT "chapterId" FROM "ChapterContentRef" WHERE "chapterId" = :id LIMIT 1'),
-                {"id": chapter_id},
-            )
-        ).mappings().first()
-        if ref:
-            mapped += 1
-
-    if total == 0:
-        raise HTTPException(status_code=400, detail="No source chapter files found")
-    if mapped != total:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot auto-complete: mapped {mapped}/{total}. Resolve missing mappings first.",
-        )
-
-    await db.execute(
-        text('UPDATE "ImportJob" SET status = :status, error = NULL, "updatedAt" = NOW() WHERE id = :id'),
-        {"id": job_id, "status": "completed"},
-    )
-    await db.execute(
-        text(
-            'UPDATE "AssetNovelMapping" SET status = :status, "updatedAt" = NOW() '
-            'WHERE "sourceAssetId" = :asset_id AND "novelId" = :novel_id'
-        ),
-        {"status": "completed", "asset_id": asset_id, "novel_id": novelId},
-    )
-    await db.commit()
-    return {"jobId": job_id, "sourceAssetId": asset_id, "novelId": novelId, "status": "completed", "mapped": mapped, "total": total}
-
-
-@app.delete("/api/import/jobs/{job_id}")
-async def delete_import_job(
-    job_id: str,
-    removeContent: bool = Query(default=True),
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    row = (
-        await db.execute(
-            text('SELECT id, "sourceAssetId" FROM "ImportJob" WHERE id = :id LIMIT 1'),
-            {"id": job_id},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Import job not found")
-
-    source_asset_id = str(row["sourceAssetId"])
-    removed_files = 0
-    removed_dir = False
-
-    if removeContent:
-        asset_dir = Path(settings.nas_content_root) / source_asset_id
-        if asset_dir.exists() and asset_dir.is_dir():
-            files = list(asset_dir.glob("**/*"))
-            for p in files:
-                if p.is_file():
-                    p.unlink(missing_ok=True)
-                    removed_files += 1
-            for p in sorted(asset_dir.glob("**/*"), key=lambda x: len(x.parts), reverse=True):
-                if p.is_dir():
-                    p.rmdir()
-            asset_dir.rmdir()
-            removed_dir = True
-
-    await db.execute(text('DELETE FROM "ImportJob" WHERE id = :id'), {"id": job_id})
-    await db.execute(text('DELETE FROM "AssetNovelMapping" WHERE "sourceAssetId" = :asset_id'), {"asset_id": source_asset_id})
-    await db.commit()
-
-    return {
-        "jobId": job_id,
-        "deleted": True,
-        "sourceAssetId": source_asset_id,
-        "removeContent": removeContent,
-        "removedFiles": removed_files,
-        "removedDir": removed_dir,
-    }
 
 
 @app.post("/api/truyen/{novel_id}/rate")

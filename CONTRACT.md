@@ -32,6 +32,7 @@ Tai lieu contract chung cho `reader`, `reader-app`, `reader-api`.
 - `409`: xung dot du lieu.
 - `422`: payload format dung JSON nhung khong dat rule nghiep vu.
 - `500`: loi he thong.
+- `410`: (du tru) tai nguyen da go bo hoac khong con ho tro.
 
 ## Pagination Convention
 
