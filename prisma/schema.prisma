@@ -82,8 +82,6 @@ model Novel {
   title         String
   originalTitle String?
   slug          String   @unique
-  seriesId      String?
-  series        Series?  @relation(fields: [seriesId], references: [id], onDelete: SetNull)
   authorName    String   // Tên tác giả nguyên bản của truyện
   originalAuthorName String?
   uploaderId    String?  // Tham chiếu đến User (Mod/Admin) đã upload
@@ -121,18 +119,6 @@ model NovelViewDaily {
 
   @@unique([novelId, day])
   @@index([day])
-}
-
-model Series {
-  id          String   @id @default(cuid())
-  name        String
-  slug        String   @unique
-  description String?  @db.Text
-
-  novels      Novel[]
-
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
 }
 
 model Genre {

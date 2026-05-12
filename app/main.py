@@ -35,7 +35,7 @@ from app.config import settings
 from app.database import get_db_session
 from app.storage import storage
 
-# Giới hạn an toàn khi tách chương EPUB (đồng bộ với batch import trên web).
+# Giới hạn chương EPUB chỉ khi client gửi `enforceMaxChapters=true` (import nhiều / batch).
 MOD_EPUB_MAX_CHAPTERS = 4000
 
 
@@ -109,6 +109,18 @@ async def _ensure_migration_tables() -> None:
                     continue
                 raise
 
+    migration_ddls = [
+        'ALTER TABLE "Novel" DROP CONSTRAINT IF EXISTS "Novel_seriesId_fkey"',
+        'ALTER TABLE "Novel" DROP COLUMN IF EXISTS "seriesId"',
+        'DROP TABLE IF EXISTS "Series" CASCADE',
+    ]
+    async with engine.begin() as conn:
+        for ddl in migration_ddls:
+            try:
+                await conn.execute(text(ddl))
+            except Exception:
+                pass
+
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
@@ -147,25 +159,6 @@ def _shuffle_rows[T](rows: list[T]) -> list[T]:
     return copied
 
 
-def _collapse_series_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    picked_series: set[str] = set()
-    output: list[dict[str, Any]] = []
-
-    for row in rows:
-        series_id = row.get("seriesId")
-        if not series_id:
-            output.append(row)
-            continue
-
-        if series_id in picked_series:
-            continue
-
-        picked_series.add(series_id)
-        output.append(row)
-
-    return output
-
-
 def _fill_unique_rows(rows: list[dict[str, Any]], fallback: list[dict[str, Any]], target: int) -> list[dict[str, Any]]:
     picked: set[str] = set()
     output: list[dict[str, Any]] = []
@@ -196,7 +189,6 @@ def _home_novel_from_row(row: dict[str, Any]) -> dict[str, Any]:
         "status": row.get("status") or "Đang ra",
         "description": row.get("description") or "",
         "bookmarkCount": int(row.get("bookmarkCount") or 0),
-        "seriesId": row.get("seriesId"),
         "updatedAt": _iso(row.get("updatedAt")),
     }
 
@@ -217,7 +209,7 @@ async def _fetch_home_ranking_rows(
             text(
                 'SELECT n.id, n.slug, n.title, n."authorName", n."coverColor", n."coverUrl", '
                 'n.rating, n.views, n."totalChapters", n.status, n.description, n."bookmarkCount", '
-                'n."seriesId", n."updatedAt", COALESCE(SUM(v.views), 0)::int AS aggregated_views '
+                'n."updatedAt", COALESCE(SUM(v.views), 0)::int AS aggregated_views '
                 'FROM "NovelViewDaily" v '
                 'JOIN "Novel" n ON n.id = v."novelId" '
                 f'{where_sql} '
@@ -232,7 +224,6 @@ async def _fetch_home_ranking_rows(
     return [
         {
             "id": row["id"],
-            "seriesId": row["seriesId"],
             "aggregatedViews": int(row.get("aggregated_views") or 0),
             "novel": _home_novel_from_row(dict(row)),
         }
@@ -245,7 +236,7 @@ async def _fetch_home_popular_fallback(db: AsyncSession, *, take: int = 400) -> 
         await db.execute(
             text(
                 'SELECT id, slug, title, "authorName", "coverColor", "coverUrl", rating, views, '
-                '"totalChapters", status, description, "bookmarkCount", "seriesId", "updatedAt" '
+                '"totalChapters", status, description, "bookmarkCount", "updatedAt" '
                 'FROM "Novel" '
                 'ORDER BY views DESC, "updatedAt" DESC '
                 'LIMIT :take'
@@ -257,7 +248,6 @@ async def _fetch_home_popular_fallback(db: AsyncSession, *, take: int = 400) -> 
     return [
         {
             "id": row["id"],
-            "seriesId": row["seriesId"],
             "aggregatedViews": int(row.get("views") or 0),
             "novel": _home_novel_from_row(dict(row)),
         }
@@ -270,7 +260,7 @@ async def _fetch_home_random_pool(db: AsyncSession, *, take: int = 420) -> list[
         await db.execute(
             text(
                 'SELECT id, slug, title, "authorName", "coverColor", "coverUrl", rating, views, '
-                '"totalChapters", status, description, "bookmarkCount", "seriesId", "updatedAt" '
+                '"totalChapters", status, description, "bookmarkCount", "updatedAt" '
                 'FROM "Novel" '
                 'ORDER BY "updatedAt" DESC '
                 'LIMIT :take'
@@ -453,7 +443,7 @@ async def _fetch_home_latest_novels(db: AsyncSession, *, take: int = 5) -> list[
         await db.execute(
             text(
                 'SELECT id, slug, title, "authorName", "coverColor", "coverUrl", rating, views, '
-                '"totalChapters", status, description, "bookmarkCount", "seriesId", "updatedAt" '
+                '"totalChapters", status, description, "bookmarkCount", "updatedAt" '
                 'FROM "Novel" '
                 'WHERE id = ANY(:novel_ids)'
             ),
@@ -463,12 +453,12 @@ async def _fetch_home_latest_novels(db: AsyncSession, *, take: int = 5) -> list[
 
     novel_map = {row["id"]: _home_novel_from_row(dict(row)) for row in novel_rows}
     ordered = [novel_map[novel_id] for novel_id in latest_novel_ids if novel_id in novel_map]
-    collapsed = _collapse_series_rows(ordered)[:take]
+    picked = ordered[:take]
 
-    for novel in collapsed:
+    for novel in picked:
         novel["latestChapter"] = latest_chapter_map.get(novel["id"])
 
-    return collapsed
+    return picked
 
 
 def _to_hot_slide(row: dict[str, Any], source: str) -> dict[str, Any]:
@@ -843,18 +833,6 @@ async def _ensure_unique_slug(db: AsyncSession, *, table: str, slug: str, curren
         candidate = f"{base}-{idx}"
 
 
-async def _resolve_series_id(
-    db: AsyncSession,
-    *,
-    series_id: str | None,
-    series_name: str | None,
-) -> str | None:
-    _ = db
-    _ = series_name
-    sid = str(series_id or "").strip()
-    return sid or None
-
-
 async def _set_novel_genres(db: AsyncSession, novel_id: str, genre_ids: list[str]) -> None:
     clean_ids = [str(g).strip() for g in (genre_ids or []) if str(g).strip()]
     await db.execute(text('DELETE FROM "NovelGenre" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
@@ -939,8 +917,7 @@ async def mod_list_novels(
     rows = (
         await db.execute(
             text(
-                'SELECT n.id, n.title, n.slug, n."authorName", n.status, n."totalChapters", n."coverUrl", '
-                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
+                'SELECT n.id, n.title, n.slug, n."authorName", n.status, n."totalChapters", n."coverUrl" '
                 'FROM "Novel" n '
                 'ORDER BY n."updatedAt" DESC, n."createdAt" DESC'
             )
@@ -955,11 +932,6 @@ async def mod_list_novels(
             "status": r.get("status") or "Đang ra",
             "totalChapters": int(r.get("totalChapters") or 0),
             "coverUrl": r.get("coverUrl"),
-            "series": (
-                {"id": r["series_id"], "name": r["series_name"], "slug": r["series_slug"]}
-                if r.get("series_id")
-                else None
-            ),
         }
         for r in rows
     ]
@@ -1007,8 +979,7 @@ async def mod_get_novel_detail(
         await db.execute(
             text(
                 'SELECT n.id, n.title, n.slug, n."authorName", n."originalTitle", n."originalAuthorName", '
-                'n.description, n."coverUrl", n.status, n."totalChapters", '
-                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
+                'n.description, n."coverUrl", n.status, n."totalChapters" '
                 'FROM "Novel" n WHERE n.id = :id LIMIT 1'
             ),
             {"id": novel_id},
@@ -1033,11 +1004,6 @@ async def mod_get_novel_detail(
         "coverUrl": row.get("coverUrl"),
         "status": row.get("status") or "Đang ra",
         "totalChapters": int(row.get("totalChapters") or 0),
-        "series": (
-            {"id": row["series_id"], "name": row["series_name"], "slug": row["series_slug"]}
-            if row.get("series_id")
-            else None
-        ),
         "genres": [dict(g) for g in genre_rows],
     }
 
@@ -1057,14 +1023,13 @@ async def mod_create_novel(
 
     slug_base = _norm_title(title).replace(" ", "-")[:120] or _new_id("n_")
     slug = await _ensure_unique_slug(db, table="Novel", slug=slug_base)
-    resolved_series_id = await _resolve_series_id(db, series_id=payload.seriesId, series_name=payload.seriesName)
 
     novel_id = _new_id("n_")
     row = (
         await db.execute(
             text(
-                'INSERT INTO "Novel" (id, title, slug, "authorName", "originalTitle", "originalAuthorName", description, "coverUrl", status, "seriesId", "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") '
-                'VALUES (:id,:title,:slug,:author,:original_title,:original_author,:description,:cover_url,:status,:series_id,0,0,0,0,0,NOW(),NOW()) '
+                'INSERT INTO "Novel" (id, title, slug, "authorName", "originalTitle", "originalAuthorName", description, "coverUrl", status, "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") '
+                'VALUES (:id,:title,:slug,:author,:original_title,:original_author,:description,:cover_url,:status,0,0,0,0,0,NOW(),NOW()) '
                 'RETURNING id, title, slug, "authorName", status, "totalChapters", "coverUrl"'
             ),
             {
@@ -1077,7 +1042,6 @@ async def mod_create_novel(
                 "description": (payload.description or "").strip(),
                 "cover_url": (payload.coverUrl or "").strip() or None,
                 "status": (payload.status or "Đang ra").strip() or "Đang ra",
-                "series_id": resolved_series_id,
             },
         )
     ).mappings().first()
@@ -1100,7 +1064,7 @@ async def mod_update_novel(
         raise HTTPException(status_code=400, detail="id là bắt buộc")
 
     current = (
-        await db.execute(text('SELECT id, title, slug, "seriesId" FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})
+        await db.execute(text('SELECT id, title, slug FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})
     ).mappings().first()
     if not current:
         raise HTTPException(status_code=404, detail="Novel not found")
@@ -1115,14 +1079,6 @@ async def mod_update_novel(
     slug_base = _norm_title(next_title).replace(" ", "-")[:120] or str(current.get("slug") or _new_id("n_"))
     next_slug = await _ensure_unique_slug(db, table="Novel", slug=slug_base, current_id=novel_id)
 
-    use_series_name = parsed.seriesName is not None and str(parsed.seriesName).strip() != ""
-    if use_series_name:
-        next_series_id = await _resolve_series_id(db, series_id=None, series_name=parsed.seriesName)
-    elif parsed.seriesId is not None:
-        next_series_id = await _resolve_series_id(db, series_id=parsed.seriesId, series_name=None)
-    else:
-        next_series_id = current.get("seriesId")
-
     row = (
         await db.execute(
             text(
@@ -1131,7 +1087,7 @@ async def mod_update_novel(
                 '"authorName" = COALESCE(:author_name, "authorName"), '
                 '"originalTitle" = :original_title, "originalAuthorName" = :original_author, '
                 'description = :description, "coverUrl" = :cover_url, '
-                'status = COALESCE(:status, status), "seriesId" = :series_id, "updatedAt" = NOW() '
+                'status = COALESCE(:status, status), "updatedAt" = NOW() '
                 'WHERE id = :id '
                 'RETURNING id, title, slug, "authorName", status, "totalChapters", "coverUrl"'
             ),
@@ -1145,7 +1101,6 @@ async def mod_update_novel(
                 "description": (parsed.description or "").strip(),
                 "cover_url": (parsed.coverUrl or "").strip() or None,
                 "status": (parsed.status or "").strip() or None,
-                "series_id": next_series_id,
             },
         )
     ).mappings().first()
@@ -1230,8 +1185,7 @@ async def mod_list_missing_novels(
     rows = (
         await db.execute(
             text(
-                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", n.description, n."totalChapters", n."updatedAt", '
-                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
+                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", n.description, n."totalChapters", n."updatedAt" '
                 'FROM "Novel" n '
                 f'{where_sql} '
                 'ORDER BY n."updatedAt" DESC, n.title ASC LIMIT 2000'
@@ -1269,11 +1223,6 @@ async def mod_list_missing_novels(
                 "description": r.get("description") or "",
                 "totalChapters": int(r.get("totalChapters") or 0),
                 "updatedAt": _iso(r.get("updatedAt")),
-                "series": (
-                    {"id": r["series_id"], "name": r["series_name"], "slug": r["series_slug"]}
-                    if r.get("series_id")
-                    else None
-                ),
                 "genres": genres,
                 "missing": {
                     "author": author_blank,
@@ -1350,12 +1299,10 @@ async def mod_overview(
     novel_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Novel"'))).scalar_one()
     total_views = (await db.execute(text('SELECT COALESCE(SUM(views),0)::int FROM "Novel"'))).scalar_one()
     comment_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Comment"'))).scalar_one()
-    series_count = 0
     return {
         "novelCount": int(novel_count or 0),
         "totalViews": int(total_views or 0),
         "commentCount": int(comment_count or 0),
-        "seriesCount": int(series_count or 0),
     }
 
 
@@ -1926,11 +1873,9 @@ async def mod_epub_upload(
     description: str | None = Form(default=None),
     genreIds: str | None = Form(default=None),
     status: str | None = Form(default=None),
-    seriesMode: str | None = Form(default=None),
-    seriesId: str | None = Form(default=None),
-    seriesName: str | None = Form(default=None),
     replaceExisting: str | None = Form(default=None),
     appendTargetNovelId: str | None = Form(default=None),
+    enforceMaxChapters: str | None = Form(default=None),
     db: AsyncSession = Depends(get_db_session),
     user: dict = Depends(require_current_user),
 ):
@@ -1966,9 +1911,19 @@ async def mod_epub_upload(
         parsed_genre_ids = [g.strip() for g in str(genreIds or "").split(",") if g.strip()]
 
         n_chapters = len(chapters)
-        if n_chapters > MOD_EPUB_MAX_CHAPTERS:
+        enforce_cap = str(enforceMaxChapters or "").lower() in {"1", "true", "yes", "on"}
+        if enforce_cap and n_chapters > MOD_EPUB_MAX_CHAPTERS:
             if str(preview or "").lower() == "true":
                 n_ch = n_chapters
+                # Vẫn trả mẫu chương để mod xác nhận tách TOC/regex đúng; chỉ chặn import do chính sách.
+                cover_blocked = _extract_epub_cover(tmp_path) or _extract_epub_cover_from_zip(tmp_path)
+                has_cover_b = bool(cover_blocked)
+                cover_data_url_b: str | None = None
+                if cover_blocked:
+                    cover_bytes_b, cover_ext_b = cover_blocked
+                    cover_ext_b = _guess_image_extension(cover_bytes_b)
+                    mime_b = _mime_from_extension(cover_ext_b)
+                    cover_data_url_b = f"data:{mime_b};base64,{base64.b64encode(cover_bytes_b).decode('ascii')}"
                 return {
                     "preview": True,
                     "importBlocked": True,
@@ -1979,8 +1934,8 @@ async def mod_epub_upload(
                     "fileName": file.filename or "upload.epub",
                     "splitMode": mode,
                     "detectedStructureType": "standard",
-                    "hasCoverFromEpub": False,
-                    "coverPreviewDataUrl": None,
+                    "hasCoverFromEpub": has_cover_b,
+                    "coverPreviewDataUrl": cover_data_url_b,
                     "parserInfo": {
                         "splitMode": mode,
                         "chapterRegexUsed": pattern,
@@ -1989,9 +1944,9 @@ async def mod_epub_upload(
                         "sectionsDroppedByFilter": max(0, len(source_sections) - len(sections_after_filter)),
                         "chaptersDetected": n_ch,
                         "chaptersFinal": n_ch,
-                        "insertedMissingChapters": 0,
-                        "detectedMaxChapterNumber": 0,
-                        "detectedNumberAssignments": 0,
+                        "insertedMissingChapters": len([c for c in chapters if c.get("is_placeholder")]),
+                        "detectedMaxChapterNumber": max([int(c.get("number") or 0) for c in chapters], default=0),
+                        "detectedNumberAssignments": len([c for c in chapters if int(c.get("number") or 0) > 0]),
                         "policySkippedHeavyScan": True,
                     },
                     "novel": {
@@ -2001,8 +1956,19 @@ async def mod_epub_upload(
                         "detectedGenres": inferred_genres,
                         "totalChapters": n_ch,
                     },
-                    "chaptersPreview": [],
-                    "sample": [],
+                    "chaptersPreview": [
+                        {
+                            "number": int(c.get("number") or 0),
+                            "title": str(c.get("title") or ""),
+                            "isPlaceholder": bool(c.get("is_placeholder") or False),
+                            "volumeNumber": None,
+                            "volumeTitle": None,
+                            "volumeChapterNumber": None,
+                            "excerpt": str(c.get("txt") or "")[:200],
+                        }
+                        for c in chapters[:30]
+                    ],
+                    "sample": _chapter_preview_samples(chapters, sample_size=10),
                 }
             raise HTTPException(
                 status_code=400,
@@ -2127,25 +2093,17 @@ async def mod_epub_upload(
                 media_type="application/json",
             )
 
-        target_series_id: str | None = None
-        sm = str(seriesMode or "none").lower()
-        if sm == "existing":
-            target_series_id = await _resolve_series_id(db, series_id=seriesId, series_name=None)
-        elif sm == "new":
-            target_series_id = await _resolve_series_id(db, series_id=None, series_name=seriesName)
-
         if existing_by_title and should_replace:
             novel_id = str(existing_by_title["id"])
             await db.execute(text('DELETE FROM "ChapterContentRef" WHERE "chapterId" IN (SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id)'), {"novel_id": novel_id})
             await db.execute(text('DELETE FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
             await db.execute(
-                text('UPDATE "Novel" SET "authorName" = :author, description = :desc, "coverUrl" = COALESCE(:cover, "coverUrl"), "seriesId" = :series_id, "updatedAt" = NOW() WHERE id = :id'),
+                text('UPDATE "Novel" SET "authorName" = :author, description = :desc, "coverUrl" = COALESCE(:cover, "coverUrl"), "updatedAt" = NOW() WHERE id = :id'),
                 {
                     "id": novel_id,
                     "author": base_author,
                     "desc": base_desc,
                     "cover": uploaded_cover_url,
-                    "series_id": target_series_id,
                 },
             )
             await db.execute(
@@ -2163,7 +2121,7 @@ async def mod_epub_upload(
             novel_id = _new_id("n_")
             slug = await _ensure_unique_slug(db, table="Novel", slug=_norm_title(base_title).replace(" ", "-")[:120] or novel_id)
             await db.execute(
-                text('INSERT INTO "Novel" (id, title, slug, "authorName", "originalTitle", "originalAuthorName", description, "coverUrl", status, "seriesId", "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:original_title,:original_author,:desc,:cover,:status,:series_id,0,0,0,0,0,NOW(),NOW())'),
+                text('INSERT INTO "Novel" (id, title, slug, "authorName", "originalTitle", "originalAuthorName", description, "coverUrl", status, "totalChapters", views, rating, "ratingCount", "bookmarkCount", "createdAt", "updatedAt") VALUES (:id,:title,:slug,:author,:original_title,:original_author,:desc,:cover,:status,0,0,0,0,0,NOW(),NOW())'),
                 {
                     "id": novel_id,
                     "title": base_title,
@@ -2174,7 +2132,6 @@ async def mod_epub_upload(
                     "desc": base_desc,
                     "cover": uploaded_cover_url,
                     "status": base_status,
-                    "series_id": target_series_id,
                 },
             )
             if parsed_genre_ids:
@@ -2228,16 +2185,9 @@ async def browse_novels(
     sort: str = "latest",
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=20, ge=1, le=500),
-    collapse_series: bool = Query(default=False),
     db: AsyncSession = Depends(get_db_session),
 ):
     skip = (page - 1) * limit
-    outer_order_clause = {
-        "popular": 'views DESC',
-        "rating": 'rating DESC',
-        "name": 'title ASC',
-        "latest": '"updatedAt" DESC',
-    }.get(sort, '"updatedAt" DESC')
     inner_order_clause = {
         "popular": 'n.views DESC',
         "rating": 'n.rating DESC',
@@ -2271,55 +2221,30 @@ async def browse_novels(
     base_select = (
         'n.id, n.title, n.slug, n."originalTitle", n."authorName", n."coverUrl", n."coverColor", '
         'n.status, n."totalChapters", n.views, n.rating, n."ratingCount", n."bookmarkCount", '
-        'n."seriesId", NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug, n."updatedAt"'
+        'n."updatedAt"'
     )
     base_from = (
         'FROM "Novel" n '
     )
 
-    if collapse_series:
-        # DISTINCT ON picks the best novel per series (most recent), then outer query sorts+paginates
-        inner_sql = (
-            f'SELECT DISTINCT ON (COALESCE(n."seriesId", n.id)) {base_select} '
-            f'{base_from}'
-            f'{where_sql} '
-            f'ORDER BY COALESCE(n."seriesId", n.id), n."updatedAt" DESC'
+    total_count = (
+        await db.execute(
+            text(f'SELECT COUNT(*)::int {base_from}{where_sql}'),
+            params,
         )
-        total_count = (
-            await db.execute(
-                text(f'SELECT COUNT(*)::int FROM ({inner_sql}) AS _c'),
-                params,
-            )
-        ).scalar_one()
-        rows = (
-            await db.execute(
-                text(
-                    f'SELECT * FROM ({inner_sql}) AS collapsed '
-                    f'ORDER BY {outer_order_clause} '
-                    f'OFFSET :skip LIMIT :limit'
-                ),
-                params,
-            )
-        ).mappings().all()
-    else:
-        total_count = (
-            await db.execute(
-                text(f'SELECT COUNT(*)::int {base_from}{where_sql}'),
-                params,
-            )
-        ).scalar_one()
-        rows = (
-            await db.execute(
-                text(
-                    f'SELECT {base_select} '
-                    f'{base_from}'
-                    f'{where_sql} '
-                    f'ORDER BY {inner_order_clause} '
-                    f'OFFSET :skip LIMIT :limit'
-                ),
-                params,
-            )
-        ).mappings().all()
+    ).scalar_one()
+    rows = (
+        await db.execute(
+            text(
+                f'SELECT {base_select} '
+                f'{base_from}'
+                f'{where_sql} '
+                f'ORDER BY {inner_order_clause} '
+                f'OFFSET :skip LIMIT :limit'
+            ),
+            params,
+        )
+    ).mappings().all()
 
     novel_ids = [row["id"] for row in rows]
     genre_map: dict[str, list[dict[str, str]]] = {novel_id: [] for novel_id in novel_ids}
@@ -2360,16 +2285,6 @@ async def browse_novels(
                 "rating": float(row["rating"] or 0),
                 "ratingCount": row["ratingCount"],
                 "bookmarkCount": row["bookmarkCount"],
-                "seriesId": row["seriesId"],
-                "series": (
-                    {
-                        "id": row["series_id"],
-                        "name": row["series_name"],
-                        "slug": row["series_slug"],
-                    }
-                    if row["series_id"]
-                    else None
-                ),
                 "genres": genre_map.get(row["id"], []),
                 "updatedAt": _iso(row["updatedAt"]),
                 "latestChapter": chapter_map.get(row["id"]),
@@ -2392,8 +2307,7 @@ async def get_novel_detail(id_or_slug: str, db: AsyncSession = Depends(get_db_se
             text(
                 'SELECT n.id, n.title, n.slug, n."originalTitle", n."authorName", n."originalAuthorName", '
                 'n.description, n."coverUrl", n."coverColor", n.status, n."totalChapters", n.views, n.rating, '
-                'n."ratingCount", n."bookmarkCount", n."seriesId", n."createdAt", n."updatedAt", '
-                'NULL::text AS series_id, NULL::text AS series_name, NULL::text AS series_slug '
+                'n."ratingCount", n."bookmarkCount", n."createdAt", n."updatedAt" '
                 'FROM "Novel" n '
                 'WHERE n.id = :value OR n.slug = :value '
                 'LIMIT 1'
@@ -2418,27 +2332,6 @@ async def get_novel_detail(id_or_slug: str, db: AsyncSession = Depends(get_db_se
         )
     ).mappings().all()
 
-    series = None
-    if row["seriesId"]:
-        series_novels = (
-            await db.execute(
-                text(
-                    'SELECT id, title, slug, "totalChapters", status, "coverUrl" '
-                    'FROM "Novel" '
-                    'WHERE "seriesId" = :series_id '
-                    'ORDER BY title ASC'
-                ),
-                {"series_id": row["seriesId"]},
-            )
-        ).mappings().all()
-
-        series = {
-            "id": row["series_id"],
-            "name": row["series_name"],
-            "slug": row["series_slug"],
-            "novels": [dict(item) for item in series_novels],
-        }
-
     return {
         "id": row["id"],
         "title": row["title"],
@@ -2455,8 +2348,6 @@ async def get_novel_detail(id_or_slug: str, db: AsyncSession = Depends(get_db_se
         "rating": float(row["rating"] or 0),
         "ratingCount": row["ratingCount"],
         "bookmarkCount": row["bookmarkCount"],
-        "seriesId": row["seriesId"],
-        "series": series,
         "genres": [dict(item) for item in genres],
         "createdAt": _iso(row["createdAt"]),
         "updatedAt": _iso(row["updatedAt"]),
@@ -2604,7 +2495,7 @@ async def suggest_novels(q: str = "", db: AsyncSession = Depends(get_db_session)
     rows = (
         await db.execute(
             text(
-                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", NULL::text AS series_id, NULL::text AS series_name '
+                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl" '
                 'FROM "Novel" n '
                 'WHERE n.title ILIKE :q OR n."authorName" ILIKE :q '
                 'ORDER BY n.views DESC, n."updatedAt" DESC '
@@ -2621,11 +2512,6 @@ async def suggest_novels(q: str = "", db: AsyncSession = Depends(get_db_session)
             "slug": row["slug"],
             "authorName": row["authorName"],
             "coverUrl": row["coverUrl"],
-            "series": (
-                {"id": row["series_id"], "name": row["series_name"]}
-                if row["series_id"]
-                else None
-            ),
         }
         for row in rows
     ]
@@ -2657,8 +2543,6 @@ class ModNovelPayload(BaseModel):
     coverUrl: str | None = None
     status: str | None = None
     genreIds: list[str] | None = None
-    seriesId: str | None = None
-    seriesName: str | None = None
 
 
 class ModNovelBulkPayload(BaseModel):

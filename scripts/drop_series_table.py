@@ -19,9 +19,11 @@ def main() -> None:
 
     engine = create_engine(_normalize_database_url(database_url))
     with engine.begin() as conn:
+        conn.execute(text('ALTER TABLE "Novel" DROP CONSTRAINT IF EXISTS "Novel_seriesId_fkey"'))
+        conn.execute(text('ALTER TABLE "Novel" DROP COLUMN IF EXISTS "seriesId"'))
         conn.execute(text('DROP TABLE IF EXISTS "Series" CASCADE'))
 
-    print("Dropped Series table")
+    print('Dropped "Series" table and "Novel"."seriesId" column (if present).')
 
 
 if __name__ == "__main__":
