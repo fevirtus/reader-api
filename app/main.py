@@ -4,7 +4,9 @@ import asyncio
 import base64
 import datetime as dt
 import hashlib
+import html as html_lib
 import json
+import logging
 import os
 import random
 import re
@@ -24,16 +26,16 @@ from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Re
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from fastapi.responses import Response
-from google.auth.transport import requests as google_requests
-from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user
+from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user, verify_google_id_token
 from app.config import settings
 from app.database import get_db_session
 from app.storage import storage
+
+logger = logging.getLogger(__name__)
 
 # Giới hạn chương EPUB chỉ khi client gửi `enforceMaxChapters=true` (import nhiều / batch).
 MOD_EPUB_MAX_CHAPTERS = 4000
@@ -1673,18 +1675,19 @@ async def mod_delete_chapter(
 
 @app.post("/api/mod/chuong/bulk-delete")
 async def mod_bulk_delete_chapters(
-    payload: ModChapterBulkDeletePayload,
+    payload: dict[str, Any] = Body(...),
     db: AsyncSession = Depends(get_db_session),
     user: dict = Depends(require_current_user),
 ):
     if user.get("role") not in ("MOD", "ADMIN"):
         raise HTTPException(status_code=403, detail="Forbidden")
-    from_num = min(payload.fromNumber, payload.toNumber)
-    to_num = max(payload.fromNumber, payload.toNumber)
+    parsed = ModChapterBulkDeletePayload.model_validate(payload)
+    from_num = min(parsed.fromNumber, parsed.toNumber)
+    to_num = max(parsed.fromNumber, parsed.toNumber)
     ids = (
         await db.execute(
             text('SELECT id FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number BETWEEN :from_num AND :to_num'),
-            {"novel_id": payload.novelId, "from_num": from_num, "to_num": to_num},
+            {"novel_id": parsed.novelId, "from_num": from_num, "to_num": to_num},
         )
     ).mappings().all()
     chapter_ids = [str(r["id"]) for r in ids]
@@ -1693,12 +1696,61 @@ async def mod_bulk_delete_chapters(
     deleted_count = (
         await db.execute(
             text('DELETE FROM "ChapterMeta" WHERE "novelId" = :novel_id AND number BETWEEN :from_num AND :to_num RETURNING id'),
-            {"novel_id": payload.novelId, "from_num": from_num, "to_num": to_num},
+            {"novel_id": parsed.novelId, "from_num": from_num, "to_num": to_num},
         )
     ).mappings().all()
-    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": payload.novelId})
+    await db.execute(text('UPDATE "Novel" SET "totalChapters" = (SELECT COUNT(*) FROM "ChapterMeta" WHERE "novelId" = :novel_id), "updatedAt" = NOW() WHERE id = :novel_id'), {"novel_id": parsed.novelId})
     await db.commit()
     return {"deletedCount": len(deleted_count)}
+
+
+@app.post("/api/mod/chuong/normalize-titles/preview")
+async def mod_normalize_chapter_titles_preview(
+    payload: dict[str, Any] = Body(...),
+    db: AsyncSession = Depends(get_db_session),
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    parsed = ModNormalizeTitlesPreviewPayload.model_validate(payload)
+    novel_id = parsed.novelId.strip()
+    if not novel_id:
+        raise HTTPException(status_code=400, detail="novelId is required")
+
+    rows = (
+        await db.execute(
+            text('SELECT id, number, title FROM "ChapterMeta" WHERE "novelId" = :novel_id ORDER BY number ASC'),
+            {"novel_id": novel_id},
+        )
+    ).mappings().all()
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        chapter_id = str(row["id"])
+        number = int(row.get("number") or 0)
+        current_title = str(row.get("title") or "").strip()
+        content = await _resolve_chapter_content(chapter_id, db) or ""
+        suggested_title = _infer_chapter_title_from_content(content, number, current_title).strip()
+        if not suggested_title or suggested_title == current_title:
+            continue
+        if parsed.overwriteGenericOnly and not _is_generic_chapter_title(current_title, number):
+            continue
+        items.append(
+            {
+                "id": chapter_id,
+                "number": number,
+                "currentTitle": current_title,
+                "suggestedTitle": suggested_title,
+            }
+        )
+
+    return {
+        "novelId": novel_id,
+        "scannedCount": len(rows),
+        "changeCount": len(items),
+        "items": items,
+    }
 
 
 @app.put("/api/mod/chuong/optimize")
@@ -1866,6 +1918,7 @@ async def mod_epub_upload(
     preview: str | None = Form(default=None),
     splitMode: str | None = Form(default=None),
     chapterRegex: str | None = Form(default=None),
+    chapterTag: str | None = Form(default=None),
     title: str | None = Form(default=None),
     originalTitle: str | None = Form(default=None),
     authorName: str | None = Form(default=None),
@@ -1891,11 +1944,12 @@ async def mod_epub_upload(
         tmp_path = Path(tmp.name)
 
     try:
-        mode = "regex" if (splitMode or "").lower() == "regex" else "toc"
+        mode = _resolve_epub_split_mode(splitMode)
         pattern = (chapterRegex or "").strip() or None
+        effective_tag = _normalize_chapter_html_tag(chapterTag) if mode == "tag" else None
         source_sections = _extract_epub_chapters(tmp_path)
         sections_after_filter = _filter_toc_chapters(source_sections) if mode == "toc" else source_sections
-        chapters = _epub_extract_with_mode(tmp_path, mode, pattern)
+        chapters = _epub_extract_with_mode(tmp_path, mode, pattern, effective_tag)
         epub_meta = _extract_epub_metadata(tmp_path)
         inferred_title = str(epub_meta.get("title") or Path(file.filename or "novel").stem)
         inferred_author = str(epub_meta.get("author") or "Unknown")
@@ -1938,7 +1992,8 @@ async def mod_epub_upload(
                     "coverPreviewDataUrl": cover_data_url_b,
                     "parserInfo": {
                         "splitMode": mode,
-                        "chapterRegexUsed": pattern,
+                        "chapterRegexUsed": pattern if mode == "regex" else None,
+                        "chapterTagUsed": effective_tag if mode == "tag" else None,
                         "sourceSections": len(source_sections),
                         "sectionsAfterFilter": len(sections_after_filter),
                         "sectionsDroppedByFilter": max(0, len(source_sections) - len(sections_after_filter)),
@@ -1999,7 +2054,8 @@ async def mod_epub_upload(
                 "coverPreviewDataUrl": cover_preview_data_url,
                 "parserInfo": {
                     "splitMode": mode,
-                    "chapterRegexUsed": pattern,
+                    "chapterRegexUsed": pattern if mode == "regex" else None,
+                    "chapterTagUsed": effective_tag if mode == "tag" else None,
                     "sourceSections": len(source_sections),
                     "sectionsAfterFilter": len(sections_after_filter),
                     "sectionsDroppedByFilter": max(0, len(source_sections) - len(sections_after_filter)),
@@ -2590,6 +2646,11 @@ class ModChapterOptimizePayload(BaseModel):
     updates: list[ModChapterOptimizeItem]
 
 
+class ModNormalizeTitlesPreviewPayload(BaseModel):
+    novelId: str
+    overwriteGenericOnly: bool = True
+
+
 class ModChapterGlobalReplacePayload(BaseModel):
     novelId: str
     action: str
@@ -2628,31 +2689,112 @@ def _asset_file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _derive_chapter_title(txt: str, fallback: str, number: int) -> str:
-    lines = [line.strip().lstrip("#").strip() for line in txt.splitlines() if line.strip()]
-    chapter_re = re.compile(r"^(?:chuong|ch\.?|chapter|hoi|quyen|phan|tap)\s*\d+(?:[\.:\-\)]\s*|\s+).+", re.IGNORECASE)
-    chapter_num_re = re.compile(r"^(?:chuong|ch\.?|chapter|hoi|quyen|phan|tap)\s*\d+", re.IGNORECASE)
+_CHAPTER_HEADING_PREFIX = r"(?:chuong|ch\.?|chapter|hoi|quyen|phan|tap)"
+_CHAPTER_WITH_SUBTITLE_RE = re.compile(
+    rf"^{_CHAPTER_HEADING_PREFIX}\s*\d+(?:[\.:\-\)]\s*|\s+).+",
+    re.IGNORECASE,
+)
+_CHAPTER_NUM_ONLY_RE = re.compile(
+    rf"^{_CHAPTER_HEADING_PREFIX}\s*(\d+)\s*[:\-\.]?\s*$",
+    re.IGNORECASE,
+)
+_CHAPTER_NUM_PREFIX_RE = re.compile(rf"^{_CHAPTER_HEADING_PREFIX}\s*(\d+)", re.IGNORECASE)
+_CHAPTER_INLINE_SUBTITLE_RE = re.compile(
+    r"^(?:Chương|Ch\.?|Chapter|Hồi|Quyển|Phần|Tập)\s*\d+(?:[\.:\-\)]\s*|\s+)(.+)$",
+    re.IGNORECASE,
+)
 
-    for line in lines[:12]:
+
+def _looks_like_body_paragraph(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    if len(s) > 200:
+        return True
+    if len(s) > 90 and s.endswith((".", "…", "!", "?", "。")):
+        return True
+    if len(s.split()) >= 10:
+        return True
+    low = s.lower()
+    if re.match(r"^(đoàn|hắn|nàng|anh|cô|tôi|người|sau khi|khi đó|trong|ngoài|bên|cả|một|hai|ba)\s", low):
+        if len(s.split()) >= 8:
+            return True
+    return False
+
+
+def _is_plausible_subtitle_line(line: str) -> bool:
+    s = line.strip()
+    if not s or len(s) < 2 or len(s) > 160:
+        return False
+    normalized = _norm_title(s)
+    if _CHAPTER_WITH_SUBTITLE_RE.match(normalized) or _CHAPTER_NUM_ONLY_RE.match(normalized):
+        return False
+    if _looks_like_body_paragraph(s):
+        return False
+    if re.search(r"https?://", s, re.IGNORECASE):
+        return False
+    return True
+
+
+def _is_generic_chapter_title(title: str, number: int) -> bool:
+    current = (title or "").strip()
+    if not current:
+        return True
+    n = int(number or 0)
+    if n <= 0:
+        return False
+    if re.fullmatch(rf"Chương\s*{n}\s*", current, re.IGNORECASE):
+        return True
+    if re.fullmatch(rf"Ch\.?\s*{n}\s*", current, re.IGNORECASE):
+        return True
+    if re.fullmatch(rf"Chapter\s*{n}\s*", current, re.IGNORECASE):
+        return True
+    return _norm_title(current) == _norm_title(f"Chương {n}")
+
+
+def _infer_chapter_title_from_content(txt: str, number: int, fallback: str = "") -> str:
+    lines = [line.strip().lstrip("#").strip() for line in (txt or "").splitlines() if line.strip()]
+
+    for idx, line in enumerate(lines[:15]):
         normalized = _norm_title(line)
         if not normalized:
             continue
-        if chapter_re.match(normalized):
-            return line
-        if chapter_num_re.match(normalized):
-            return line
+
+        inline = _CHAPTER_INLINE_SUBTITLE_RE.match(line.strip())
+        if inline:
+            subtitle = (inline.group(1) or "").strip()
+            if subtitle:
+                return subtitle
+
+        if _CHAPTER_WITH_SUBTITLE_RE.match(normalized):
+            return line.strip()
+
+        if _CHAPTER_NUM_PREFIX_RE.match(normalized):
+            if _CHAPTER_NUM_ONLY_RE.match(normalized):
+                if idx + 1 < len(lines):
+                    next_line = lines[idx + 1].strip()
+                    if _is_plausible_subtitle_line(next_line):
+                        return next_line
+                return line.strip()
+            return line.strip()
 
     if lines:
-        first = lines[0]
-        if len(first) <= 160 and len(first.split()) >= 3:
-            # Prefer human-readable first heading over EPUB internal filename.
-            if "/" in fallback or fallback.lower().endswith(".xhtml"):
+        first = lines[0].strip()
+        if _is_plausible_subtitle_line(first):
+            if "/" in (fallback or "") or str(fallback or "").lower().endswith(".xhtml"):
                 return first
-            return first
+            if len(first.split()) >= 2:
+                return first
 
-    if fallback and "/" not in fallback and not fallback.lower().endswith(".xhtml"):
-        return fallback
+    cleaned_fallback = (fallback or "").strip()
+    if cleaned_fallback and "/" not in cleaned_fallback and not cleaned_fallback.lower().endswith(".xhtml"):
+        if not _is_generic_chapter_title(cleaned_fallback, number):
+            return cleaned_fallback
     return f"Chương {number}"
+
+
+def _derive_chapter_title(txt: str, fallback: str, number: int) -> str:
+    return _infer_chapter_title_from_content(txt, number, fallback)
 
 
 def _extract_title_chapter_number(title: str) -> int | None:
@@ -2783,6 +2925,25 @@ def _filter_toc_chapters(chapters: list[dict[str, Any]]) -> list[dict[str, Any]]
     return out
 
 
+def _resolve_epub_split_mode(split_mode: str | None) -> str:
+    raw = (split_mode or "toc").strip().lower()
+    if raw == "regex":
+        return "regex"
+    if raw in {"tag", "html_tag", "html-tag", "htmltag"}:
+        return "tag"
+    return "toc"
+
+
+def _normalize_chapter_html_tag(tag: str | None) -> str:
+    cleaned = (tag or "a").strip().lower()
+    if not re.fullmatch(r"[a-z][a-z0-9]*", cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail="chapterTag must be a simple HTML tag name (letters/digits), e.g. a, h2",
+        )
+    return cleaned
+
+
 def _extract_epub_chapters_by_regex(epub_path: Path, chapter_start_pattern: str) -> list[dict[str, Any]]:
     chapters = _extract_epub_chapters(epub_path)
     pattern = chapter_start_pattern.strip()
@@ -2852,7 +3013,12 @@ def _chapter_preview_samples(chapters: list[dict[str, Any]], sample_size: int = 
     return out
 
 
-def _epub_extract_with_mode(epub_path: Path, split_mode: str, chapter_start_pattern: str | None) -> list[dict[str, Any]]:
+def _epub_extract_with_mode(
+    epub_path: Path,
+    split_mode: str,
+    chapter_start_pattern: str | None,
+    chapter_tag: str | None = None,
+) -> list[dict[str, Any]]:
     if split_mode == "regex":
         default_vi_regex = r"^\s*(?:[#>*\-\[]\s*)*(?:ch(?:u\.?|ương|uong)?|chapter|hồi|hoi|quyển|quyen|phần|phan|tập|tap)\s*\d+(?:[\.:\-\)]\s*|\s+).+$"
         effective_pattern = chapter_start_pattern or default_vi_regex
@@ -2860,6 +3026,30 @@ def _epub_extract_with_mode(epub_path: Path, split_mode: str, chapter_start_patt
             return _normalize_chapter_sequence(_extract_epub_chapters_by_regex(epub_path, effective_pattern))
         except re.error as exc:
             raise HTTPException(status_code=400, detail=f"Invalid chapterStartPattern: {exc}") from exc
+    if split_mode == "tag":
+        from app.epub_parser import build_merged_html_from_epub, extract_chapters_by_html_tag
+
+        effective_tag = _normalize_chapter_html_tag(chapter_tag)
+        merged, tag_stats = extract_chapters_by_html_tag(epub_path, effective_tag)
+        if not merged:
+            merged_html = build_merged_html_from_epub(epub_path)
+            tag_opens = int(tag_stats.get("tagOpens") or 0)
+            if not merged_html.strip():
+                detail = "EPUB không có nội dung HTML trong các file document."
+            elif tag_opens == 0:
+                detail = (
+                    f"Không tìm thấy thẻ <{effective_tag}> trong EPUB. "
+                    f"Thử thẻ khác (h2, h1, p) hoặc chế độ TOC/Regex."
+                )
+            else:
+                filtered = int(tag_stats.get("tagOpensFiltered") or 0)
+                extra = f" (đã lọc bỏ {filtered} thẻ <a> không giống mục chương)" if filtered else ""
+                detail = (
+                    f"Tìm thấy {tag_opens} thẻ <{effective_tag}>{extra} "
+                    f"nhưng không tạo được chương có nội dung. Thử thẻ khác hoặc TOC/Regex."
+                )
+            raise HTTPException(status_code=400, detail=detail)
+        return _normalize_chapter_sequence(merged)
     return _normalize_chapter_sequence(_extract_epub_chapters(epub_path))
 
 
@@ -3346,6 +3536,236 @@ def _map_genres_to_existing(candidates: list[str], existing_genres: list[str], *
 
 
 _ROUTER_MODEL_CACHE: dict[str, Any] = {"expires_at": 0.0, "models": []}
+_ROUTER_PICK_LIMIT = 8
+_ROUTER_FAMILY_PICK_LIMITS: dict[str, int] = {
+    "openai": 3,
+    "deepseek": 4,
+    "claude": 2,
+    "gemini": 2,
+    "other": 2,
+}
+_ROUTER_FAMILY_PICK_ORDER: tuple[str, ...] = ("openai", "deepseek", "claude", "gemini", "other")
+
+
+def _router_model_family(model_id: str) -> str:
+    low = model_id.lower()
+    if "gpt" in low or low.startswith("openai/"):
+        return "openai"
+    if "deepseek" in low or low.startswith("ds/") or "/ds/" in low:
+        return "deepseek"
+    if "claude" in low or "anthropic" in low:
+        return "claude"
+    if "gemini" in low or "google" in low:
+        return "gemini"
+    return "other"
+
+
+def _router_pick_models_from_candidates(candidates: list[tuple[int, str]]) -> list[str]:
+    by_family: dict[str, list[tuple[int, str]]] = {}
+    for score, model_id in candidates:
+        by_family.setdefault(_router_model_family(model_id), []).append((score, model_id))
+    for family_models in by_family.values():
+        family_models.sort(key=lambda x: (-x[0], x[1]))
+
+    picked: list[str] = []
+    for family in _ROUTER_FAMILY_PICK_ORDER:
+        limit = _ROUTER_FAMILY_PICK_LIMITS.get(family, 1)
+        for _score, model_id in by_family.get(family, [])[:limit]:
+            if model_id not in picked:
+                picked.append(model_id)
+
+    if len(picked) < _ROUTER_PICK_LIMIT:
+        for _score, model_id in sorted(candidates, key=lambda x: (-x[0], x[1])):
+            if len(picked) >= _ROUTER_PICK_LIMIT:
+                break
+            if model_id not in picked:
+                picked.append(model_id)
+    return picked[:_ROUTER_PICK_LIMIT]
+
+
+def _router_model_priority_score(model_id: str) -> int:
+    low = model_id.lower()
+    if "gpt-5.5" in low:
+        return 1000
+    if "gpt-5" in low:
+        return 900
+    if _router_model_family(model_id) == "deepseek":
+        return 850
+    if "claude" in low:
+        return 700
+    if "gemini" in low:
+        return 650
+    return 100
+
+
+def _router_parse_http_json(raw: str) -> Any:
+    """Parse OpenAI-compatible HTTP bodies (9router may append SSE sentinels)."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty router response body")
+
+    done_idx = text.find("data: [DONE]")
+    if done_idx != -1:
+        text = text[:done_idx].rstrip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        obj, _end = decoder.raw_decode(text)
+        return obj
+
+
+def _router_collect_sse_payloads(raw: str) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if not chunk or chunk == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payloads.append(parsed)
+    return payloads
+
+
+def _router_merge_streaming_completion(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {"choices": [{"message": {"role": "assistant", "content": ""}}]}
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for payload in payloads:
+        for choice in payload.get("choices") or []:
+            delta = choice.get("delta") or {}
+            message = choice.get("message") or {}
+            for key, bucket in (
+                ("content", content_parts),
+                ("reasoning_content", reasoning_parts),
+            ):
+                piece = delta.get(key)
+                if piece is None:
+                    piece = message.get(key)
+                if piece:
+                    bucket.append(str(piece))
+    if content_parts:
+        merged["choices"][0]["message"]["content"] = "".join(content_parts)
+    if reasoning_parts:
+        merged["choices"][0]["message"]["reasoning_content"] = "".join(reasoning_parts)
+    return merged
+
+
+def _router_parse_completion_body(raw: str, *, model_id: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty router response body")
+
+    if text.startswith("data:") or "\ndata:" in text:
+        payloads = _router_collect_sse_payloads(text)
+        if payloads:
+            return _router_merge_streaming_completion(payloads)
+
+    data = _router_parse_http_json(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"router response is not an object for model={model_id}")
+    return data
+
+
+def _router_strip_json_fences(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    return stripped.strip()
+
+
+def _router_parse_json_object(text: str) -> dict[str, Any] | None:
+    candidate = _router_strip_json_fences(text)
+    if not candidate:
+        return None
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    try:
+        decoder = json.JSONDecoder()
+        obj, _end = decoder.raw_decode(candidate)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", candidate)
+    if not match:
+        return None
+    try:
+        obj = json.loads(match.group(0))
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _router_normalize_message_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+            elif isinstance(item, dict):
+                if item.get("type") == "text":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+                elif "text" in item:
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        parts.append(text)
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
+def _router_extract_assistant_content(completion: dict[str, Any], model_id: str) -> str:
+    choice = (completion.get("choices") or [{}])[0] or {}
+    message = choice.get("message") or {}
+    family = _router_model_family(model_id)
+
+    content = _router_normalize_message_content(message.get("content"))
+    if content:
+        return content
+
+    if family == "deepseek":
+        reasoning = str(message.get("reasoning_content") or "").strip()
+        if reasoning:
+            parsed = _router_parse_json_object(reasoning)
+            if parsed:
+                return json.dumps(parsed, ensure_ascii=False)
+            tail = reasoning[-4000:]
+            parsed = _router_parse_json_object(tail)
+            if parsed:
+                return json.dumps(parsed, ensure_ascii=False)
+
+    if family == "gemini":
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            return _router_normalize_message_content(parts)
+
+    return ""
+
+
+def _router_parse_suggest_result(completion: dict[str, Any], model_id: str) -> dict[str, Any] | None:
+    content = _router_extract_assistant_content(completion, model_id)
+    if not content:
+        return None
+    parsed = _router_parse_json_object(content)
+    if not parsed:
+        return None
+    return parsed
 
 
 def _normalize_vietnamese_novel_status(raw: str | None) -> str:
@@ -3379,30 +3799,20 @@ async def _router_pick_models() -> list[str]:
                 headers=headers,
             )
         response.raise_for_status()
-        for item in (response.json().get("data") or []):
+        models_payload = _router_parse_http_json(response.text)
+        for item in (models_payload.get("data") or []):
             model_id = str(item.get("id") or "").strip()
             if not model_id:
                 continue
             low = model_id.lower()
             if any(x in low for x in ["vision", "image", "audio", "realtime", "embedding", "moderation"]):
                 continue
-            score = 0
-            if "gpt-5.5" in low:
-                score += 1000
-            elif "gpt-5" in low:
-                score += 900
-            elif "claude" in low:
-                score += 700
-            elif "gemini" in low:
-                score += 650
-            else:
-                score += 100
-            candidates.append((score, model_id))
-    except Exception:
+            candidates.append((_router_model_priority_score(model_id), model_id))
+    except Exception as exc:
+        logger.warning("router models list failed: %s", exc)
         candidates = []
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    picked = [m for _, m in candidates[:6]]
+    picked = _router_pick_models_from_candidates(candidates)
     _ROUTER_MODEL_CACHE["models"] = picked
     _ROUTER_MODEL_CACHE["expires_at"] = now + 600
     return picked
@@ -3479,6 +3889,7 @@ async def _router_ai_suggest(
     for model_id in models:
         payload = dict(base_payload)
         payload["model"] = model_id
+        family = _router_model_family(model_id)
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
                 response = await client.post(
@@ -3486,10 +3897,24 @@ async def _router_ai_suggest(
                     headers=headers,
                     json=payload,
                 )
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            parsed = json.loads(content) if isinstance(content, str) else {}
+            if response.status_code >= 400:
+                logger.info(
+                    "router ai-suggest skip model=%s family=%s status=%s body=%s",
+                    model_id,
+                    family,
+                    response.status_code,
+                    (response.text or "")[:240],
+                )
+                continue
+            completion = _router_parse_completion_body(response.text, model_id=model_id)
+            parsed = _router_parse_suggest_result(completion, model_id)
+            if not parsed:
+                logger.info(
+                    "router ai-suggest skip model=%s family=%s reason=unparseable_content",
+                    model_id,
+                    family,
+                )
+                continue
             raw_genres = [str(g).strip() for g in (parsed.get("genres") or []) if str(g).strip()][:6]
             genres = _map_genres_to_existing(raw_genres, existing_genres, limit=6)
             short_description = str(parsed.get("shortDescription") or "").strip()
@@ -3500,6 +3925,13 @@ async def _router_ai_suggest(
                 confidence = 0.0
             confidence = max(0.0, min(1.0, confidence))
             if not short_description or not genres:
+                logger.info(
+                    "router ai-suggest skip model=%s family=%s reason=empty_fields genres=%s desc_len=%s",
+                    model_id,
+                    family,
+                    len(genres),
+                    len(short_description),
+                )
                 continue
             return {
                 "suggestedGenres": genres,
@@ -3508,7 +3940,13 @@ async def _router_ai_suggest(
                 "model": model_id,
                 "suggestedStatus": novel_status,
             }
-        except Exception:
+        except Exception as exc:
+            logger.info(
+                "router ai-suggest skip model=%s family=%s reason=exception err=%s",
+                model_id,
+                family,
+                exc,
+            )
             continue
     return None
 
@@ -3570,6 +4008,7 @@ async def mod_epub_ai_suggest(
     file: UploadFile = File(...),
     splitMode: str | None = Form(default=None),
     chapterRegex: str | None = Form(default=None),
+    chapterTag: str | None = Form(default=None),
     title: str | None = Form(default=None),
     authorName: str | None = Form(default=None),
     db: AsyncSession = Depends(get_db_session),
@@ -3587,11 +4026,12 @@ async def mod_epub_ai_suggest(
         tmp_path = Path(tmp.name)
 
     try:
-        mode = "regex" if (splitMode or "").lower() == "regex" else "toc"
+        mode = _resolve_epub_split_mode(splitMode)
         pattern = (chapterRegex or "").strip() or None
+        effective_tag = _normalize_chapter_html_tag(chapterTag) if mode == "tag" else None
         source_sections = _extract_epub_chapters(tmp_path)
         sections_after_filter = _filter_toc_chapters(source_sections) if mode == "toc" else source_sections
-        chapters = _epub_extract_with_mode(tmp_path, mode, pattern)
+        chapters = _epub_extract_with_mode(tmp_path, mode, pattern, effective_tag)
         meta = _extract_epub_metadata(tmp_path)
         resolved_title = " ".join((title or str(meta.get("title") or tmp_path.stem)).split()).strip() or tmp_path.stem
         resolved_author = " ".join((authorName or str(meta.get("author") or "Unknown")).split()).strip() or "Unknown"
@@ -4198,20 +4638,7 @@ async def mobile_login(payload: MobileLoginPayload, db: AsyncSession = Depends(g
     if not payload.googleIdToken.strip():
         raise HTTPException(status_code=400, detail="googleIdToken is required")
 
-    allowed_client_ids = settings.google_client_id_list
-
-    try:
-        id_info = google_id_token.verify_oauth2_token(
-            payload.googleIdToken,
-            google_requests.Request(),
-            None,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail="Invalid Google token") from exc
-
-    aud = (id_info.get("aud") or "").strip()
-    if allowed_client_ids and aud not in set(allowed_client_ids):
-        raise HTTPException(status_code=401, detail="Invalid Google token audience")
+    id_info = verify_google_id_token(payload.googleIdToken)
 
     email = id_info.get("email")
     if not email:
