@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html as html_lib
+import posixpath as zip_path
 import re
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,25 @@ from typing import Any
 import html2text
 from ebooklib import ITEM_DOCUMENT
 from ebooklib import epub as epublib
+
+
+class _TolerantEpubReader(epublib.EpubReader):
+    """Bỏ qua mục manifest trỏ tới file không có trong archive."""
+
+    def read_file(self, name):
+        name = zip_path.normpath(name)
+        try:
+            return self.zf.read(name)
+        except KeyError:
+            return b""
+
+
+def read_epub_safe(epub_path: Path, *, ignore_ncx: bool = False) -> epublib.EpubBook:
+    options = {"ignore_ncx": ignore_ncx}
+    reader = _TolerantEpubReader(str(epub_path), options)
+    book = reader.load()
+    reader.process()
+    return book
 
 _CHAPTER_MARKER_TEXT_RE = re.compile(
     r"(?:ch(?:u(?:ơng|ong))?|chapter|hồi|hoi|phần|phan|tập|tap|quyển|quyen)\s*\d+",
@@ -29,7 +49,7 @@ def _html_to_text(html_content: str) -> str:
 
 
 def build_merged_html_from_epub(epub_path: Path) -> str:
-    book = epublib.read_epub(str(epub_path), options={"ignore_ncx": False})
+    book = read_epub_safe(epub_path)
     parts: list[str] = []
     for item in book.get_items_of_type(ITEM_DOCUMENT):
         content = item.get_content().decode("utf-8", errors="replace")
@@ -39,7 +59,7 @@ def build_merged_html_from_epub(epub_path: Path) -> str:
 
 
 def build_chapters_from_epub(epub_path: Path) -> list[dict[str, Any]]:
-    book = epublib.read_epub(str(epub_path), options={"ignore_ncx": False})
+    book = read_epub_safe(epub_path)
     out: list[dict[str, Any]] = []
     idx = 1
     for item in book.get_items_of_type(ITEM_DOCUMENT):
