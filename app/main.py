@@ -480,6 +480,45 @@ def _to_hot_slide(row: dict[str, Any], source: str) -> dict[str, Any]:
     }
 
 
+def _bookmark_shelf_status(
+    last_chapter_number: int | None,
+    total_chapters: int | None,
+    read_chapters: list[int] | None,
+) -> str:
+    has_progress = last_chapter_number is not None or bool(read_chapters)
+    total = int(total_chapters or 0)
+    if has_progress and total > 0 and last_chapter_number is not None and last_chapter_number >= total:
+        return "completed"
+    if has_progress:
+        return "reading"
+    return "saved"
+
+
+def _serialize_bookmark_row(row: Any) -> dict[str, Any]:
+    read_chapters = list(row["readChapters"] or [])
+    last_chapter_number = row["lastChapterNumber"]
+    total_chapters = int(row["novel_total_chapters"] or 0)
+    return {
+        "id": row["id"],
+        "novelId": row["novelId"],
+        "lastChapterId": row["lastChapterId"],
+        "lastChapterNumber": last_chapter_number,
+        "readChapters": read_chapters,
+        "shelfStatus": _bookmark_shelf_status(last_chapter_number, total_chapters, read_chapters),
+        "novel": {
+            "id": row["novel_id"],
+            "title": row["novel_title"],
+            "slug": row["novel_slug"],
+            "authorName": row["novel_author_name"],
+            "coverUrl": row["novel_cover_url"],
+            "status": row["novel_status"],
+            "totalChapters": total_chapters,
+            "rating": float(row["novel_rating"] or 0),
+            "ratingCount": int(row["novel_rating_count"] or 0),
+        },
+    }
+
+
 async def _load_bookmark_with_novel(db: AsyncSession, user_id: str, novel_id: str) -> dict[str, Any] | None:
     result = await db.execute(
         text(
@@ -499,24 +538,7 @@ async def _load_bookmark_with_novel(db: AsyncSession, user_id: str, novel_id: st
     if not row:
         return None
 
-    return {
-        "id": row["id"],
-        "novelId": row["novelId"],
-        "lastChapterId": row["lastChapterId"],
-        "lastChapterNumber": row["lastChapterNumber"],
-        "readChapters": row["readChapters"] or [],
-        "novel": {
-            "id": row["novel_id"],
-            "title": row["novel_title"],
-            "slug": row["novel_slug"],
-            "authorName": row["novel_author_name"],
-            "coverUrl": row["novel_cover_url"],
-            "status": row["novel_status"],
-            "totalChapters": row["novel_total_chapters"],
-            "rating": float(row["novel_rating"] or 0),
-            "ratingCount": int(row["novel_rating_count"] or 0),
-        },
-    }
+    return _serialize_bookmark_row(row)
 
 
 async def _update_reading_progress(
@@ -4201,7 +4223,11 @@ async def create_comment(
 
 
 @app.get("/api/user/bookmarks")
-async def list_bookmarks(request: Request, db: AsyncSession = Depends(get_db_session)):
+async def list_bookmarks(
+    request: Request,
+    shelfStatus: str | None = None,
+    db: AsyncSession = Depends(get_db_session),
+):
     user = await require_current_user(request, db)
 
     rows = (
@@ -4220,27 +4246,11 @@ async def list_bookmarks(request: Request, db: AsyncSession = Depends(get_db_ses
         )
     ).mappings().all()
 
-    return [
-        {
-            "id": row["id"],
-            "novelId": row["novelId"],
-            "lastChapterId": row["lastChapterId"],
-            "lastChapterNumber": row["lastChapterNumber"],
-            "readChapters": row["readChapters"] or [],
-            "novel": {
-                "id": row["novel_id"],
-                "title": row["novel_title"],
-                "slug": row["novel_slug"],
-                "authorName": row["novel_author_name"],
-                "coverUrl": row["novel_cover_url"],
-                "status": row["novel_status"],
-                "totalChapters": row["novel_total_chapters"],
-                "rating": float(row["novel_rating"] or 0),
-                "ratingCount": int(row["novel_rating_count"] or 0),
-            },
-        }
-        for row in rows
-    ]
+    bookmarks = [_serialize_bookmark_row(row) for row in rows]
+    status_filter = (shelfStatus or "").strip().lower()
+    if status_filter in {"reading", "completed", "saved"}:
+        bookmarks = [bookmark for bookmark in bookmarks if bookmark["shelfStatus"] == status_filter]
+    return bookmarks
 
 
 class BookmarkPayload(BaseModel):
