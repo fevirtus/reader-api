@@ -75,32 +75,6 @@ async def _ensure_migration_tables() -> None:
             UNIQUE("novelId", number)
         )
         ''',
-        '''
-        CREATE TABLE IF NOT EXISTS "UserRecommendationDoc" (
-            id TEXT PRIMARY KEY,
-            "userId" TEXT NOT NULL,
-            "novelId" TEXT NOT NULL,
-            content TEXT,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        ''',
-        '''
-        CREATE UNIQUE INDEX IF NOT EXISTS "UserRecommendationDoc_user_novel_key"
-        ON "UserRecommendationDoc"("userId", "novelId")
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS "EditorRecommendationDoc" (
-            id TEXT PRIMARY KEY,
-            "editorId" TEXT NOT NULL,
-            "novelId" TEXT NOT NULL,
-            content TEXT,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        ''',
-        '''
-        CREATE INDEX IF NOT EXISTS "EditorRecommendationDoc_novel_idx"
-        ON "EditorRecommendationDoc"("novelId")
-        ''',
     ]
 
     async with engine.begin() as conn:
@@ -116,6 +90,11 @@ async def _ensure_migration_tables() -> None:
         'ALTER TABLE "Novel" DROP CONSTRAINT IF EXISTS "Novel_seriesId_fkey"',
         'ALTER TABLE "Novel" DROP COLUMN IF EXISTS "seriesId"',
         'DROP TABLE IF EXISTS "Series" CASCADE',
+        'ALTER TABLE "Bookmark" ADD COLUMN IF NOT EXISTS "markedAsRead" BOOLEAN NOT NULL DEFAULT false',
+        'UPDATE "Novel" SET rating = rating * 2 WHERE "ratingCount" > 0 AND rating > 0 AND rating <= 5',
+        'DROP TABLE IF EXISTS "Comment" CASCADE',
+        'DROP TABLE IF EXISTS "UserRecommendationDoc" CASCADE',
+        'DROP TABLE IF EXISTS "EditorRecommendationDoc" CASCADE',
     ]
     async with engine.begin() as conn:
         for ddl in migration_ddls:
@@ -275,140 +254,28 @@ async def _fetch_home_random_pool(db: AsyncSession, *, take: int = 420) -> list[
     return [_home_novel_from_row(dict(row)) for row in rows]
 
 
-async def _fetch_home_manual_recommendations(db: AsyncSession) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    try:
-        editor_rows = (
-            await db.execute(
-                text('SELECT id, "editorId", "novelId", content, "createdAt" FROM "EditorRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 2000')
-            )
-        ).mappings().all()
-        user_rows = (
-            await db.execute(
-                text('SELECT id, "userId", "novelId", content, "createdAt" FROM "UserRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 5000')
-            )
-        ).mappings().all()
-    except Exception:
-        return [], []
-    editor_docs = [dict(r) for r in editor_rows]
-    user_docs = [dict(r) for r in user_rows]
-
-    novel_ids = list(
-        {
-            str(item.get("novelId"))
-            for item in [*editor_docs, *user_docs]
-            if item.get("novelId")
-        }
-    )
-    editor_ids = list({str(item.get("editorId")) for item in editor_docs if item.get("editorId")})
-
+async def _fetch_latest_chapter_map(db: AsyncSession, novel_ids: list[str]) -> dict[str, dict[str, Any]]:
     if not novel_ids:
-        return [], []
-
-    novel_rows = (
+        return {}
+    chapter_rows = (
         await db.execute(
             text(
-                'SELECT id, slug, title, "authorName", "coverUrl", rating '
-                'FROM "Novel" '
-                'WHERE id = ANY(:novel_ids)'
+                'SELECT DISTINCT ON ("novelId") "novelId", number, title, "createdAt" '
+                'FROM "ChapterMeta" '
+                'WHERE "novelId" = ANY(:novel_ids) '
+                'ORDER BY "novelId", "createdAt" DESC NULLS LAST, number DESC'
             ),
             {"novel_ids": novel_ids},
         )
     ).mappings().all()
-    editor_rows = []
-    if editor_ids:
-        editor_rows = (
-            await db.execute(
-                text('SELECT id, name FROM "User" WHERE id = ANY(:editor_ids)'),
-                {"editor_ids": editor_ids},
-            )
-        ).mappings().all()
-
-    novel_map = {
-        row["id"]: {
-            "id": row["id"],
-            "slug": row["slug"],
-            "title": row["title"],
-            "authorName": row["authorName"],
-            "coverUrl": row.get("coverUrl"),
-            "rating": float(row.get("rating") or 0),
+    return {
+        str(row["novelId"]): {
+            "number": row.get("number"),
+            "title": row.get("title"),
+            "createdAt": _iso(row.get("createdAt")),
         }
-        for row in novel_rows
+        for row in chapter_rows
     }
-    editor_map = {row["id"]: row.get("name") or "Biên tập viên" for row in editor_rows}
-
-    recommend_count_map: dict[str, int] = {}
-    for doc in [*editor_docs, *user_docs]:
-        novel_id = str(doc.get("novelId") or "")
-        if not novel_id:
-            continue
-        recommend_count_map[novel_id] = recommend_count_map.get(novel_id, 0) + 1
-
-    top_items = [
-        {"novel": novel_map[novel_id], "recommendCount": count}
-        for novel_id, count in recommend_count_map.items()
-        if novel_id in novel_map
-    ]
-    top_items.sort(
-        key=lambda item: (
-            -item["recommendCount"],
-            -float(item["novel"].get("rating") or 0),
-        )
-    )
-
-    editor_items: list[dict[str, Any]] = []
-    for doc in editor_docs:
-        novel_id = str(doc.get("novelId") or "")
-        if novel_id not in novel_map:
-            continue
-        editor_items.append(
-            {
-                "novel": novel_map[novel_id],
-                "editorName": editor_map.get(str(doc.get("editorId") or ""), "Biên tập viên"),
-                "recommendCount": recommend_count_map.get(novel_id, 0),
-                "createdAt": _iso(doc.get("createdAt")),
-            }
-        )
-
-    editor_items.sort(
-        key=lambda item: (
-            -item["recommendCount"],
-            item["createdAt"] or "",
-        ),
-        reverse=False,
-    )
-    editor_items.reverse()
-
-    for item in editor_items:
-        item.pop("createdAt", None)
-
-    return top_items, editor_items
-
-
-async def _fetch_home_recent_comments(db: AsyncSession, *, take: int = 10) -> list[dict[str, Any]]:
-    rows = (
-        await db.execute(
-            text(
-                'SELECT c.id, c.content, c."createdAt", u.name AS username, n.slug AS novel_slug, n.title AS novel_title '
-                'FROM "Comment" c '
-                'JOIN "User" u ON u.id = c."userId" '
-                'JOIN "Novel" n ON n.id = c."novelId" '
-                'ORDER BY c."createdAt" DESC '
-                'LIMIT :take'
-            ),
-            {"take": take},
-        )
-    ).mappings().all()
-
-    return [
-        {
-            "id": row["id"],
-            "content": row["content"],
-            "createdAt": _iso(row["createdAt"]),
-            "user": {"name": row.get("username")},
-            "novel": {"slug": row["novel_slug"], "title": row["novel_title"]},
-        }
-        for row in rows
-    ]
 
 
 async def _fetch_home_latest_novels(db: AsyncSession, *, take: int = 5) -> list[dict[str, Any]]:
@@ -485,7 +352,10 @@ def _bookmark_shelf_status(
     last_chapter_number: int | None,
     total_chapters: int | None,
     read_chapters: list[int] | None,
+    marked_as_read: bool = False,
 ) -> str:
+    if marked_as_read:
+        return "completed"
     has_progress = last_chapter_number is not None or bool(read_chapters)
     total = int(total_chapters or 0)
     if has_progress and total > 0 and last_chapter_number is not None and last_chapter_number >= total:
@@ -499,13 +369,17 @@ def _serialize_bookmark_row(row: Any) -> dict[str, Any]:
     read_chapters = list(row["readChapters"] or [])
     last_chapter_number = row["lastChapterNumber"]
     total_chapters = int(row["novel_total_chapters"] or 0)
+    marked_as_read = bool(row.get("markedAsRead"))
     return {
         "id": row["id"],
         "novelId": row["novelId"],
         "lastChapterId": row["lastChapterId"],
         "lastChapterNumber": last_chapter_number,
         "readChapters": read_chapters,
-        "shelfStatus": _bookmark_shelf_status(last_chapter_number, total_chapters, read_chapters),
+        "markedAsRead": marked_as_read,
+        "shelfStatus": _bookmark_shelf_status(
+            last_chapter_number, total_chapters, read_chapters, marked_as_read
+        ),
         "novel": {
             "id": row["novel_id"],
             "title": row["novel_title"],
@@ -524,7 +398,7 @@ async def _load_bookmark_with_novel(db: AsyncSession, user_id: str, novel_id: st
     result = await db.execute(
         text(
             'SELECT b.id, b."novelId", b."lastChapterId", b."lastChapterNumber", '
-            'b."readChapters", '
+            'b."readChapters", b."markedAsRead", '
             'n.id AS novel_id, n.title AS novel_title, n.slug AS novel_slug, n."authorName" AS novel_author_name, '
             'n."coverUrl" AS novel_cover_url, n.status AS novel_status, n."totalChapters" AS novel_total_chapters, '
             'n.rating AS novel_rating, n."ratingCount" AS novel_rating_count '
@@ -923,7 +797,6 @@ async def _delete_novel_by_id(db: AsyncSession, novel_id: str) -> bool:
     await db.execute(text('DELETE FROM "ChapterMeta" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
     await db.execute(text('DELETE FROM "NovelGenre" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
     await db.execute(text('DELETE FROM "Bookmark" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
-    await db.execute(text('DELETE FROM "Comment" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
     await db.execute(text('DELETE FROM "NovelViewDaily" WHERE "novelId" = :novel_id'), {"novel_id": novel_id})
     deleted = (await db.execute(text('DELETE FROM "Novel" WHERE id = :id RETURNING id'), {"id": novel_id})).mappings().first()
     return bool(deleted)
@@ -1177,143 +1050,6 @@ async def mod_bulk_novel_action(
     return {"action": action, "deletedCount": deleted_count}
 
 
-@app.get("/api/mod/truyen/missing")
-async def mod_list_missing_novels(
-    missing: str = "author,cover,description,genres",
-    q: str = "",
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    keys = {k.strip() for k in missing.split(",") if k.strip()}
-    filters: list[str] = []
-    if "author" in keys:
-        filters.append('(COALESCE(TRIM(n."authorName"), \'\') = \'\')')
-    if "cover" in keys:
-        filters.append('(COALESCE(TRIM(n."coverUrl"), \'\') = \'\')')
-    if "description" in keys:
-        filters.append('(COALESCE(TRIM(n.description), \'\') = \'\')')
-    if "genres" in keys:
-        filters.append('(NOT EXISTS (SELECT 1 FROM "NovelGenre" ng2 WHERE ng2."novelId" = n.id))')
-
-    where_parts: list[str] = []
-    params: dict[str, Any] = {}
-    if filters:
-        where_parts.append(f"({' OR '.join(filters)})")
-    if q.strip():
-        params["q"] = f"%{q.strip()}%"
-        where_parts.append('(n.title ILIKE :q OR n.slug ILIKE :q OR n."authorName" ILIKE :q)')
-    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-
-    rows = (
-        await db.execute(
-            text(
-                'SELECT n.id, n.title, n.slug, n."authorName", n."coverUrl", n.description, n."totalChapters", n."updatedAt" '
-                'FROM "Novel" n '
-                f'{where_sql} '
-                'ORDER BY n."updatedAt" DESC, n.title ASC LIMIT 2000'
-            ),
-            params,
-        )
-    ).mappings().all()
-
-    novel_ids = [str(r["id"]) for r in rows]
-    genre_map: dict[str, list[dict[str, Any]]] = {nid: [] for nid in novel_ids}
-    if novel_ids:
-        genre_rows = (
-            await db.execute(
-                text('SELECT ng."novelId", g.id, g.name, g.slug FROM "NovelGenre" ng JOIN "Genre" g ON g.id = ng."genreId" WHERE ng."novelId" = ANY(:novel_ids) ORDER BY g.name ASC'),
-                {"novel_ids": novel_ids},
-            )
-        ).mappings().all()
-        for g in genre_rows:
-            genre_map[str(g["novelId"])].append({"id": g["id"], "name": g["name"], "slug": g["slug"]})
-
-    items: list[dict[str, Any]] = []
-    for r in rows:
-        genres = genre_map.get(str(r["id"]), [])
-        author_blank = not str(r.get("authorName") or "").strip()
-        cover_blank = not str(r.get("coverUrl") or "").strip()
-        desc_blank = not str(r.get("description") or "").strip()
-        genre_blank = len(genres) == 0
-        items.append(
-            {
-                "id": r["id"],
-                "title": r["title"],
-                "slug": r["slug"],
-                "authorName": r.get("authorName") or "",
-                "coverUrl": r.get("coverUrl"),
-                "description": r.get("description") or "",
-                "totalChapters": int(r.get("totalChapters") or 0),
-                "updatedAt": _iso(r.get("updatedAt")),
-                "genres": genres,
-                "missing": {
-                    "author": author_blank,
-                    "cover": cover_blank,
-                    "description": desc_blank,
-                    "genres": genre_blank,
-                },
-            }
-        )
-
-    return {"items": items}
-
-
-@app.patch("/api/mod/truyen/missing")
-async def mod_patch_missing_novels(
-    payload: ModNovelMissingBulkPatchPayload,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    updated_count = 0
-    failures: list[dict[str, Any]] = []
-
-    for item in payload.updates:
-        novel_id = str(item.id or "").strip()
-        if not novel_id:
-            failures.append({"id": item.id, "error": "id không hợp lệ"})
-            continue
-        try:
-            exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})).mappings().first()
-            if not exists:
-                failures.append({"id": novel_id, "error": "Novel not found"})
-                continue
-
-            await db.execute(
-                text(
-                    'UPDATE "Novel" SET '
-                    '"authorName" = COALESCE(:author_name, "authorName"), '
-                    '"coverUrl" = COALESCE(:cover_url, "coverUrl"), '
-                    'description = COALESCE(:description, description), '
-                    '"updatedAt" = NOW() '
-                    'WHERE id = :id'
-                ),
-                {
-                    "id": novel_id,
-                    "author_name": (item.authorName or "").strip() or None,
-                    "cover_url": (item.coverUrl or "").strip() or None,
-                    "description": (item.description or "").strip() or None,
-                },
-            )
-            if item.genreIds is not None:
-                await _set_novel_genres(db, novel_id, item.genreIds)
-            updated_count += 1
-        except Exception as exc:
-            failures.append({"id": novel_id, "error": str(exc)})
-
-    await db.commit()
-    return {
-        "updatedCount": updated_count,
-        "failureCount": len(failures),
-        "failures": failures,
-    }
-
-
 @app.get("/api/mod/overview")
 async def mod_overview(
     db: AsyncSession = Depends(get_db_session),
@@ -1323,206 +1059,11 @@ async def mod_overview(
         raise HTTPException(status_code=403, detail="Forbidden")
     novel_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Novel"'))).scalar_one()
     total_views = (await db.execute(text('SELECT COALESCE(SUM(views),0)::int FROM "Novel"'))).scalar_one()
-    comment_count = (await db.execute(text('SELECT COUNT(*)::int FROM "Comment"'))).scalar_one()
     return {
         "novelCount": int(novel_count or 0),
         "totalViews": int(total_views or 0),
-        "commentCount": int(comment_count or 0),
     }
 
-
-async def _ensure_editor_recommendation_table(db: AsyncSession) -> None:
-    await db.execute(
-        text(
-            'CREATE TABLE IF NOT EXISTS "EditorRecommendationDoc" ('
-            'id TEXT PRIMARY KEY, '
-            '"editorId" TEXT NOT NULL, '
-            '"novelId" TEXT NOT NULL, '
-            'content TEXT, '
-            '"createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()'
-            ')'
-        )
-    )
-    await db.execute(
-        text('CREATE INDEX IF NOT EXISTS "EditorRecommendationDoc_novel_idx" ON "EditorRecommendationDoc"("novelId")')
-    )
-    await db.commit()
-
-
-@app.get("/api/mod/de-cu")
-async def mod_list_recommendations(
-    q: str = "",
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await _ensure_editor_recommendation_table(db)
-
-    docs = (
-        await db.execute(
-            text('SELECT id, "editorId", "novelId", "createdAt" FROM "EditorRecommendationDoc" ORDER BY "createdAt" DESC LIMIT 5000')
-        )
-    ).mappings().all()
-    novel_ids = list({str(d.get("novelId") or "") for d in docs if d.get("novelId")})
-    editor_ids = list({str(d.get("editorId") or "") for d in docs if d.get("editorId")})
-
-    novel_map: dict[str, dict[str, Any]] = {}
-    if novel_ids:
-        rows = (
-            await db.execute(
-                text('SELECT id, title, slug, "authorName", "coverUrl", status, "totalChapters" FROM "Novel" WHERE id = ANY(:ids)'),
-                {"ids": novel_ids},
-            )
-        ).mappings().all()
-        novel_map = {str(r["id"]): dict(r) for r in rows}
-
-    editor_map: dict[str, str] = {}
-    if editor_ids:
-        rows = (
-            await db.execute(
-                text('SELECT id, name FROM "User" WHERE id = ANY(:ids)'),
-                {"ids": editor_ids},
-            )
-        ).mappings().all()
-        editor_map = {str(r["id"]): str(r.get("name") or "Biên tập viên") for r in rows}
-
-    rec_count_map: dict[str, int] = {}
-    for d in docs:
-        nid = str(d.get("novelId") or "")
-        if not nid:
-            continue
-        rec_count_map[nid] = rec_count_map.get(nid, 0) + 1
-
-    items: list[dict[str, Any]] = []
-    for d in docs:
-        nid = str(d.get("novelId") or "")
-        if nid not in novel_map:
-            continue
-        eid = str(d.get("editorId") or "")
-        items.append(
-            {
-                "id": str(d.get("id")),
-                "createdAt": _iso(d.get("createdAt")),
-                "recommendCount": int(rec_count_map.get(nid, 0)),
-                "novel": novel_map[nid],
-                "editor": {"id": eid, "name": editor_map.get(eid, "Biên tập viên")},
-            }
-        )
-
-    summary = [
-        {"novel": novel_map[nid], "recommendCount": int(count)}
-        for nid, count in rec_count_map.items()
-        if nid in novel_map
-    ]
-    summary.sort(key=lambda x: (-int(x["recommendCount"]), str(x["novel"].get("title") or "")))
-
-    params: dict[str, Any] = {}
-    where_sql = ""
-    if q.strip():
-        params["q"] = f"%{q.strip()}%"
-        where_sql = 'WHERE title ILIKE :q OR slug ILIKE :q OR "authorName" ILIKE :q'
-    candidates_rows = (
-        await db.execute(
-            text(
-                f'SELECT id, title, slug, "authorName", "coverUrl", status, "totalChapters" FROM "Novel" '
-                f'{where_sql} ORDER BY "updatedAt" DESC LIMIT 100'
-            ),
-            params,
-        )
-    ).mappings().all()
-    my_editor_id = str(user.get("id") or "")
-    my_novel_ids = {str(d.get("novelId") or "") for d in docs if str(d.get("editorId") or "") == my_editor_id}
-    candidates = []
-    for r in candidates_rows:
-        nid = str(r["id"])
-        candidates.append(
-            {
-                **dict(r),
-                "alreadyRecommended": nid in my_novel_ids,
-                "recommendCount": int(rec_count_map.get(nid, 0)),
-            }
-        )
-
-    my_count = sum(1 for d in docs if str(d.get("editorId") or "") == my_editor_id)
-    return {
-        "items": items,
-        "summary": summary,
-        "candidates": candidates,
-        "myNovelIds": list(my_novel_ids),
-        "currentUser": {
-            "id": my_editor_id,
-            "role": str(user.get("role") or "USER"),
-            "recommendationCount": my_count,
-            "maxRecommendationCount": 5,
-        },
-    }
-
-
-@app.post("/api/mod/de-cu")
-async def mod_create_recommendation(
-    payload: dict[str, Any] = Body(...),
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await _ensure_editor_recommendation_table(db)
-    novel_id = str(payload.get("novelId") or "").strip()
-    if not novel_id:
-        raise HTTPException(status_code=400, detail="novelId is required")
-    novel_exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id = :id LIMIT 1'), {"id": novel_id})).mappings().first()
-    if not novel_exists:
-        raise HTTPException(status_code=404, detail="Novel not found")
-    editor_id = str(user.get("id") or "")
-    existing = (
-        await db.execute(
-            text('SELECT id FROM "EditorRecommendationDoc" WHERE "editorId" = :editor_id AND "novelId" = :novel_id LIMIT 1'),
-            {"editor_id": editor_id, "novel_id": novel_id},
-        )
-    ).mappings().first()
-    if existing:
-        raise HTTPException(status_code=409, detail="Bạn đã đề cử truyện này")
-    my_count = (
-        await db.execute(
-            text('SELECT COUNT(*)::int FROM "EditorRecommendationDoc" WHERE "editorId" = :editor_id'),
-            {"editor_id": editor_id},
-        )
-    ).scalar_one()
-    if str(user.get("role") or "") != "ADMIN" and int(my_count or 0) >= 5:
-        raise HTTPException(status_code=400, detail="Đã đạt giới hạn đề cử")
-    rec_id = _new_id("erec_")
-    await db.execute(
-        text('INSERT INTO "EditorRecommendationDoc" (id, "editorId", "novelId", "createdAt") VALUES (:id,:editor_id,:novel_id,NOW())'),
-        {"id": rec_id, "editor_id": editor_id, "novel_id": novel_id},
-    )
-    await db.commit()
-    return {"id": rec_id, "novelId": novel_id}
-
-
-@app.delete("/api/mod/de-cu")
-async def mod_delete_recommendation(
-    id: str,
-    db: AsyncSession = Depends(get_db_session),
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await _ensure_editor_recommendation_table(db)
-    row = (
-        await db.execute(
-            text('SELECT id, "editorId" FROM "EditorRecommendationDoc" WHERE id = :id LIMIT 1'),
-            {"id": id},
-        )
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Recommendation not found")
-    is_admin = str(user.get("role") or "") == "ADMIN"
-    if not is_admin and str(row.get("editorId") or "") != str(user.get("id") or ""):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    await db.execute(text('DELETE FROM "EditorRecommendationDoc" WHERE id = :id'), {"id": id})
-    await db.commit()
-    return {"id": id, "deleted": True}
 
 
 async def _upsert_chapter_content(chapter_id: str, novel_id: str, number: int, content: str, db: AsyncSession) -> None:
@@ -2345,7 +1886,7 @@ async def browse_novels(
                 {"id": row["id"], "name": row["name"], "slug": row["slug"]}
             )
 
-    chapter_map: dict[str, dict[str, Any]] = {}
+    chapter_map = await _fetch_latest_chapter_map(db, novel_ids)
 
     items: list[dict[str, Any]] = []
     for row in rows:
@@ -2597,7 +2138,7 @@ async def suggest_novels(q: str = "", db: AsyncSession = Depends(get_db_session)
 
 
 class RatePayload(BaseModel):
-    score: float = Field(ge=1, le=5)
+    score: float = Field(ge=1, le=10)
 
 
 class ModGenrePayload(BaseModel):
@@ -2627,18 +2168,6 @@ class ModNovelPayload(BaseModel):
 class ModNovelBulkPayload(BaseModel):
     action: str
     ids: list[str]
-
-
-class ModNovelMissingUpdatePayload(BaseModel):
-    id: str
-    authorName: str | None = None
-    coverUrl: str | None = None
-    description: str | None = None
-    genreIds: list[str] | None = None
-
-
-class ModNovelMissingBulkPatchPayload(BaseModel):
-    updates: list[ModNovelMissingUpdatePayload]
 
 
 class ModChapterPayload(BaseModel):
@@ -3738,115 +3267,6 @@ async def rate_novel(novel_id: str, payload: RatePayload, db: AsyncSession = Dep
     return {"rating": float(row["rating"] or 0), "ratingCount": int(row["ratingCount"] or 0)}
 
 
-@app.get("/api/truyen/{novel_id}/comments")
-async def list_comments(
-    novel_id: str,
-    chapterId: str | None = None,
-    scope: str | None = None,
-    page: int = Query(default=1, ge=1),
-    limit: int = Query(default=20, ge=1, le=50),
-    db: AsyncSession = Depends(get_db_session),
-):
-    skip = (page - 1) * limit
-    if chapterId:
-        where_sql = 'c."novelId" = :novel_id AND c."chapterId" = :chapter_id'
-        params = {"novel_id": novel_id, "chapter_id": chapterId, "skip": skip, "limit": limit}
-    elif scope == "chapter":
-        where_sql = 'c."novelId" = :novel_id AND c."chapterId" IS NOT NULL'
-        params = {"novel_id": novel_id, "skip": skip, "limit": limit}
-    else:
-        where_sql = 'c."novelId" = :novel_id AND c."chapterId" IS NULL'
-        params = {"novel_id": novel_id, "skip": skip, "limit": limit}
-
-    rows = (
-        await db.execute(
-            text(
-                f'SELECT c.id, c."userId", c."novelId", c."chapterId", c.content, c."createdAt", '
-                f'u.name AS username, u.image AS avatar_url '
-                f'FROM "Comment" c '
-                f'JOIN "User" u ON u.id = c."userId" '
-                f'WHERE {where_sql} '
-                f'ORDER BY c."createdAt" DESC '
-                f'OFFSET :skip LIMIT :limit'
-            ),
-            params,
-        )
-    ).mappings().all()
-
-    total_count = (
-        await db.execute(
-            text(f'SELECT COUNT(*)::int FROM "Comment" c WHERE {where_sql}'),
-            {k: v for k, v in params.items() if k in {"novel_id", "chapter_id"}},
-        )
-    ).scalar_one()
-
-    return {
-        "comments": [
-            {
-                "id": row["id"],
-                "userId": row["userId"],
-                "username": row["username"] or "User",
-                "avatarUrl": row["avatar_url"],
-                "novelId": row["novelId"],
-                "chapterId": row["chapterId"],
-                "content": row["content"],
-                "createdAt": _iso(row["createdAt"]),
-            }
-            for row in rows
-        ],
-        "totalCount": total_count,
-        "totalPages": (total_count + limit - 1) // limit if total_count else 0,
-        "currentPage": page,
-    }
-
-
-class CommentPayload(BaseModel):
-    content: str
-    chapterId: str | None = None
-
-
-@app.post("/api/truyen/{novel_id}/comments")
-async def create_comment(
-    novel_id: str,
-    payload: CommentPayload,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-):
-    user = await require_current_user(request, db)
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(status_code=400, detail="Content is required")
-
-    row = (
-        await db.execute(
-            text(
-                'INSERT INTO "Comment"(id, content, "userId", "novelId", "chapterId", "createdAt", "updatedAt") '
-                'VALUES (:id, :content, :user_id, :novel_id, :chapter_id, NOW(), NOW()) '
-                'RETURNING id, content, "createdAt"'
-            ),
-            {
-                "id": _new_id("cmt_"),
-                "content": content,
-                "user_id": user["id"],
-                "novel_id": novel_id,
-                "chapter_id": payload.chapterId,
-            },
-        )
-    ).mappings().first()
-
-    await db.commit()
-
-    return {
-        "id": row["id"],
-        "userId": user["id"],
-        "username": user.get("name") or "User",
-        "avatarColor": user.get("image") or "bg-primary",
-        "novelId": novel_id,
-        "chapterId": payload.chapterId,
-        "content": row["content"],
-        "createdAt": _iso(row["createdAt"]),
-    }
-
 
 @app.get("/api/user/bookmarks")
 async def list_bookmarks(
@@ -3859,7 +3279,7 @@ async def list_bookmarks(
     rows = (
         await db.execute(
             text(
-                'SELECT b.id, b."novelId", b."lastChapterId", b."lastChapterNumber", b."readChapters", '
+                'SELECT b.id, b."novelId", b."lastChapterId", b."lastChapterNumber", b."readChapters", b."markedAsRead", '
                 'n.id AS novel_id, n.title AS novel_title, n.slug AS novel_slug, n."authorName" AS novel_author_name, '
                 'n."coverUrl" AS novel_cover_url, n.status AS novel_status, n."totalChapters" AS novel_total_chapters, '
                 'n.rating AS novel_rating, n."ratingCount" AS novel_rating_count '
@@ -3900,41 +3320,43 @@ async def upsert_bookmark(payload: BookmarkPayload, request: Request, db: AsyncS
         )
     ).mappings().first()
 
-    if action == "toggle":
+    if action == "markAsRead":
         if existing:
             await db.execute(
-                text('DELETE FROM "Bookmark" WHERE id = :bookmark_id'),
+                text('UPDATE "Bookmark" SET "markedAsRead" = true WHERE id = :bookmark_id'),
                 {"bookmark_id": existing["id"]},
             )
+        else:
             await db.execute(
-                text('UPDATE "Novel" SET "bookmarkCount" = GREATEST("bookmarkCount" - 1, 0) WHERE id = :novel_id'),
+                text(
+                    'INSERT INTO "Bookmark"(id, "userId", "novelId", "readChapters", "hasCountedView", "markedAsRead", "createdAt") '
+                    'VALUES (:id, :user_id, :novel_id, :read_chapters, false, true, NOW())'
+                ),
+                {
+                    "id": _new_id("bm_"),
+                    "user_id": user["id"],
+                    "novel_id": payload.novelId,
+                    "read_chapters": [],
+                },
+            )
+            await db.execute(
+                text('UPDATE "Novel" SET "bookmarkCount" = "bookmarkCount" + 1 WHERE id = :novel_id'),
                 {"novel_id": payload.novelId},
             )
-            await db.commit()
-            return {"status": "removed"}
+        await db.commit()
+        bookmark = await _load_bookmark_with_novel(db, user["id"], payload.novelId)
+        return {"status": "marked", "bookmark": bookmark}
 
+    if action == "unmarkAsRead":
+        if not existing:
+            raise HTTPException(status_code=404, detail="Bookmark not found")
         await db.execute(
-            text(
-                'INSERT INTO "Bookmark"(id, "userId", "novelId", "lastChapterId", "lastChapterNumber", '
-                '"readChapters", "hasCountedView", "createdAt") '
-                'VALUES (:id, :user_id, :novel_id, :last_chapter_id, :last_chapter_number, :read_chapters, false, NOW())'
-            ),
-            {
-                "id": _new_id("bm_"),
-                "user_id": user["id"],
-                "novel_id": payload.novelId,
-                "last_chapter_id": payload.lastChapterId,
-                "last_chapter_number": payload.lastChapterNumber,
-                "read_chapters": [payload.lastChapterNumber] if payload.lastChapterNumber else [],
-            },
-        )
-        await db.execute(
-            text('UPDATE "Novel" SET "bookmarkCount" = "bookmarkCount" + 1 WHERE id = :novel_id'),
-            {"novel_id": payload.novelId},
+            text('UPDATE "Bookmark" SET "markedAsRead" = false WHERE id = :bookmark_id'),
+            {"bookmark_id": existing["id"]},
         )
         await db.commit()
         bookmark = await _load_bookmark_with_novel(db, user["id"], payload.novelId)
-        return {"status": "added", "bookmark": bookmark}
+        return {"status": "unmarked", "bookmark": bookmark}
 
     if action == "updateProgress":
         if payload.lastChapterId is None or payload.lastChapterNumber is None:
@@ -4129,140 +3551,6 @@ async def save_user_settings(
         "letterSpacing": letter_spacing,
         "fontFamily": font_family,
     }
-
-
-@app.get("/api/user/recommendations")
-async def list_recommendations(request: Request, db: AsyncSession = Depends(get_db_session)):
-    user = await require_current_user(request, db)
-
-    try:
-        docs = (
-            await db.execute(
-                text(
-                    'SELECT id, "novelId", "createdAt" FROM "UserRecommendationDoc" '
-                    'WHERE "userId" = :user_id ORDER BY "createdAt" DESC LIMIT 1000'
-                ),
-                {"user_id": user["id"]},
-            )
-        ).mappings().all()
-    except Exception:
-        return []
-
-    novel_ids = list({doc.get("novelId") for doc in docs if doc.get("novelId")})
-    novel_map: dict[str, dict[str, Any]] = {}
-
-    if novel_ids:
-        rows = (
-            await db.execute(
-                text(
-                    'SELECT id, title, slug, "authorName", "coverUrl", status, "totalChapters" '
-                    'FROM "Novel" WHERE id = ANY(:novel_ids)'
-                ),
-                {"novel_ids": novel_ids},
-            )
-        ).mappings().all()
-        novel_map = {row["id"]: dict(row) for row in rows}
-
-    items: list[dict[str, Any]] = []
-    for doc in docs:
-        novel_id = doc.get("novelId")
-        if not novel_id or novel_id not in novel_map:
-            continue
-        items.append(
-            {
-                "id": str(doc.get("id")),
-                "novelId": novel_id,
-                "createdAt": _iso(doc.get("createdAt")),
-                "novel": novel_map[novel_id],
-            }
-        )
-
-    return items
-
-
-class RecommendationPayload(BaseModel):
-    novelId: str
-
-
-@app.post("/api/user/recommendations")
-async def create_recommendation(
-    payload: RecommendationPayload,
-    request: Request,
-    db: AsyncSession = Depends(get_db_session),
-):
-    user = await require_current_user(request, db)
-
-    novel_exists = (
-        await db.execute(
-            text('SELECT id FROM "Novel" WHERE id = :novel_id LIMIT 1'),
-            {"novel_id": payload.novelId},
-        )
-    ).scalar_one_or_none()
-    if not novel_exists:
-        raise HTTPException(status_code=404, detail="Truyện không tồn tại")
-
-    try:
-        existing = (
-            await db.execute(
-                text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
-                {"user_id": user["id"], "novel_id": payload.novelId},
-            )
-        ).mappings().first()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Recommendation service is initializing") from exc
-    if existing:
-        raise HTTPException(status_code=409, detail="Bạn đã đề cử truyện này rồi")
-
-    now = dt.datetime.now(dt.timezone.utc)
-    rec_id = _new_id("urec_")
-    await db.execute(
-        text(
-            'INSERT INTO "UserRecommendationDoc" (id, "userId", "novelId", "createdAt") '
-            'VALUES (:id, :user_id, :novel_id, :created_at)'
-        ),
-        {"id": rec_id, "user_id": user["id"], "novel_id": payload.novelId, "created_at": now},
-    )
-
-    await db.execute(
-        text('UPDATE "Novel" SET "bookmarkCount" = "bookmarkCount" + 1 WHERE id = :novel_id'),
-        {"novel_id": payload.novelId},
-    )
-    await db.commit()
-
-    return {"id": rec_id, "novelId": payload.novelId}
-
-
-@app.delete("/api/user/recommendations")
-async def delete_recommendation(
-    request: Request,
-    novelId: str = Query(...),
-    db: AsyncSession = Depends(get_db_session),
-):
-    user = await require_current_user(request, db)
-
-    try:
-        existing = (
-            await db.execute(
-                text('SELECT id FROM "UserRecommendationDoc" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'),
-                {"user_id": user["id"], "novel_id": novelId},
-            )
-        ).mappings().first()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Recommendation service is initializing") from exc
-    if not existing:
-        raise HTTPException(status_code=404, detail="Bạn chưa đề cử truyện này")
-
-    await db.execute(
-        text('DELETE FROM "UserRecommendationDoc" WHERE id = :id'),
-        {"id": existing["id"]},
-    )
-    await db.execute(
-        text('UPDATE "Novel" SET "bookmarkCount" = GREATEST("bookmarkCount" - 1, 0) WHERE id = :novel_id'),
-        {"novel_id": novelId},
-    )
-    await db.commit()
-
-    return {"success": True}
 
 
 class MobileLoginPayload(BaseModel):

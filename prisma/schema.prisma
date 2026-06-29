@@ -45,7 +45,6 @@ model User {
 
   accounts      Account[]
   sessions      Session[]
-  comments      Comment[]
   bookmarks     Bookmark[]
   novels        Novel[]   @relation("AuthorNovels") // Truyện do người này (MOD/ADMIN) đăng
   settings      UserSetting?
@@ -98,7 +97,6 @@ model Novel {
   trashWords    String[] @default([])
   
   genres        NovelGenre[]
-  comments      Comment[]
   bookmarks     Bookmark[]
   dailyViews    NovelViewDaily[]
 
@@ -142,20 +140,6 @@ model NovelGenre {
   @@id([novelId, genreId])
 }
 
-model Comment {
-  id        String   @id @default(cuid())
-  content   String   @db.Text
-  userId    String
-  novelId   String
-  chapterId String?  // Bình luận theo chương (id chương từ backend / ChapterMeta)
-  
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  novel     Novel    @relation(fields: [novelId], references: [id], onDelete: Cascade)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
 model Bookmark {
   id                String   @id @default(cuid())
   userId            String
@@ -164,6 +148,7 @@ model Bookmark {
   lastChapterNumber Int?
   readChapters      Int[]    @default([])
   hasCountedView    Boolean  @default(false)
+  markedAsRead      Boolean  @default(false)
   
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   novel     Novel    @relation(fields: [novelId], references: [id], onDelete: Cascade)
