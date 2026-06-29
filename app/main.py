@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user, verify_google_id_token
 from app.config import settings
 from app.database import get_db_session
+from app import openrouter
 from app.storage import storage
 
 logger = logging.getLogger(__name__)
@@ -3151,11 +3152,29 @@ def _build_ai_genre_suggestions(chapters: list[dict[str, Any]]) -> list[str]:
 
 
 def _build_ai_description(title: str, author: str | None, chapters: list[dict[str, Any]]) -> str:
-    first = (str(chapters[0].get("txt") or "")[:180] if chapters else "").strip()
+    snippets: list[str] = []
+    if chapters:
+        picks = [chapters[0]]
+        if len(chapters) > 2:
+            picks.append(chapters[len(chapters) // 2])
+        if len(chapters) > 1 and chapters[-1] not in picks:
+            picks.append(chapters[-1])
+        for ch in picks:
+            text = str(ch.get("txt") or "")[:280].strip()
+            if text:
+                snippets.append(text)
     author_text = author or "Tác giả chưa rõ"
-    if first:
-        return f"{title} của {author_text} mở ra câu chuyện với nhịp đọc cuốn hút, tập trung vào hành trình nhân vật chính và các bước ngoặt liên tiếp. Bối cảnh được triển khai rõ nét, phù hợp cho độc giả thích theo dõi mạch truyện dài hơi."
-    return f"{title} là tác phẩm của {author_text}, có nhịp truyện rõ ràng và dễ theo dõi theo từng chương. Nội dung phù hợp để đọc liên tục với mạch phát triển ổn định."
+    context = snippets[0] if snippets else ""
+    lines = [
+        f"{title} của {author_text} mở ra một thế giới với nhịp kể chuyện cuốn hút, tập trung vào hành trình và lựa chọn của nhân vật chính.",
+        "Bối cảnh được triển khai rõ nét qua từng chương, tạo cảm giác tiến triển liên tục và dễ theo dõi dài hơi.",
+    ]
+    if context:
+        lines.append("Mạch truyện gợi mở nhiều xung đột và điểm nhấn cảm xúc, phù hợp độc giả thích khám phá dần cốt lõi câu chuyện.")
+    else:
+        lines.append("Nội dung phù hợp để đọc liên tục với mạch phát triển ổn định theo từng chương.")
+    lines.append("Tác phẩm hướng tới trải nghiệm đọc mượt, có không khí riêng và tiềm năng giữ chân người đọc từ những chương đầu.")
+    return "\n".join(lines)
 
 
 def _extract_epub_cover(epub_path: Path) -> tuple[bytes, str] | None:
@@ -3557,422 +3576,6 @@ def _map_genres_to_existing(candidates: list[str], existing_genres: list[str], *
     return output
 
 
-_ROUTER_MODEL_CACHE: dict[str, Any] = {"expires_at": 0.0, "models": []}
-_ROUTER_PICK_LIMIT = 8
-_ROUTER_FAMILY_PICK_LIMITS: dict[str, int] = {
-    "openai": 3,
-    "deepseek": 4,
-    "claude": 2,
-    "gemini": 2,
-    "other": 2,
-}
-_ROUTER_FAMILY_PICK_ORDER: tuple[str, ...] = ("openai", "deepseek", "claude", "gemini", "other")
-
-
-def _router_model_family(model_id: str) -> str:
-    low = model_id.lower()
-    if "gpt" in low or low.startswith("openai/"):
-        return "openai"
-    if "deepseek" in low or low.startswith("ds/") or "/ds/" in low:
-        return "deepseek"
-    if "claude" in low or "anthropic" in low:
-        return "claude"
-    if "gemini" in low or "google" in low:
-        return "gemini"
-    return "other"
-
-
-def _router_pick_models_from_candidates(candidates: list[tuple[int, str]]) -> list[str]:
-    by_family: dict[str, list[tuple[int, str]]] = {}
-    for score, model_id in candidates:
-        by_family.setdefault(_router_model_family(model_id), []).append((score, model_id))
-    for family_models in by_family.values():
-        family_models.sort(key=lambda x: (-x[0], x[1]))
-
-    picked: list[str] = []
-    for family in _ROUTER_FAMILY_PICK_ORDER:
-        limit = _ROUTER_FAMILY_PICK_LIMITS.get(family, 1)
-        for _score, model_id in by_family.get(family, [])[:limit]:
-            if model_id not in picked:
-                picked.append(model_id)
-
-    if len(picked) < _ROUTER_PICK_LIMIT:
-        for _score, model_id in sorted(candidates, key=lambda x: (-x[0], x[1])):
-            if len(picked) >= _ROUTER_PICK_LIMIT:
-                break
-            if model_id not in picked:
-                picked.append(model_id)
-    return picked[:_ROUTER_PICK_LIMIT]
-
-
-def _router_model_priority_score(model_id: str) -> int:
-    low = model_id.lower()
-    if "gpt-5.5" in low:
-        return 1000
-    if "gpt-5" in low:
-        return 900
-    if _router_model_family(model_id) == "deepseek":
-        return 850
-    if "claude" in low:
-        return 700
-    if "gemini" in low:
-        return 650
-    return 100
-
-
-def _router_parse_http_json(raw: str) -> Any:
-    """Parse OpenAI-compatible HTTP bodies (9router may append SSE sentinels)."""
-    text = (raw or "").strip()
-    if not text:
-        raise ValueError("empty router response body")
-
-    done_idx = text.find("data: [DONE]")
-    if done_idx != -1:
-        text = text[:done_idx].rstrip()
-
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        decoder = json.JSONDecoder()
-        obj, _end = decoder.raw_decode(text)
-        return obj
-
-
-def _router_collect_sse_payloads(raw: str) -> list[dict[str, Any]]:
-    payloads: list[dict[str, Any]] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        chunk = line[5:].strip()
-        if not chunk or chunk == "[DONE]":
-            continue
-        try:
-            parsed = json.loads(chunk)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            payloads.append(parsed)
-    return payloads
-
-
-def _router_merge_streaming_completion(payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    merged: dict[str, Any] = {"choices": [{"message": {"role": "assistant", "content": ""}}]}
-    content_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    for payload in payloads:
-        for choice in payload.get("choices") or []:
-            delta = choice.get("delta") or {}
-            message = choice.get("message") or {}
-            for key, bucket in (
-                ("content", content_parts),
-                ("reasoning_content", reasoning_parts),
-            ):
-                piece = delta.get(key)
-                if piece is None:
-                    piece = message.get(key)
-                if piece:
-                    bucket.append(str(piece))
-    if content_parts:
-        merged["choices"][0]["message"]["content"] = "".join(content_parts)
-    if reasoning_parts:
-        merged["choices"][0]["message"]["reasoning_content"] = "".join(reasoning_parts)
-    return merged
-
-
-def _router_parse_completion_body(raw: str, *, model_id: str) -> dict[str, Any]:
-    text = (raw or "").strip()
-    if not text:
-        raise ValueError("empty router response body")
-
-    if text.startswith("data:") or "\ndata:" in text:
-        payloads = _router_collect_sse_payloads(text)
-        if payloads:
-            return _router_merge_streaming_completion(payloads)
-
-    data = _router_parse_http_json(text)
-    if not isinstance(data, dict):
-        raise ValueError(f"router response is not an object for model={model_id}")
-    return data
-
-
-def _router_strip_json_fences(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
-        stripped = re.sub(r"\s*```$", "", stripped)
-    return stripped.strip()
-
-
-def _router_parse_json_object(text: str) -> dict[str, Any] | None:
-    candidate = _router_strip_json_fences(text)
-    if not candidate:
-        return None
-    try:
-        parsed = json.loads(candidate)
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        pass
-    try:
-        decoder = json.JSONDecoder()
-        obj, _end = decoder.raw_decode(candidate)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{[\s\S]*\}", candidate)
-    if not match:
-        return None
-    try:
-        obj = json.loads(match.group(0))
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
-
-
-def _router_normalize_message_content(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str) and item.strip():
-                parts.append(item.strip())
-            elif isinstance(item, dict):
-                if item.get("type") == "text":
-                    text = str(item.get("text") or "").strip()
-                    if text:
-                        parts.append(text)
-                elif "text" in item:
-                    text = str(item.get("text") or "").strip()
-                    if text:
-                        parts.append(text)
-        return "\n".join(parts).strip()
-    return str(content).strip()
-
-
-def _router_extract_assistant_content(completion: dict[str, Any], model_id: str) -> str:
-    choice = (completion.get("choices") or [{}])[0] or {}
-    message = choice.get("message") or {}
-    family = _router_model_family(model_id)
-
-    content = _router_normalize_message_content(message.get("content"))
-    if content:
-        return content
-
-    if family == "deepseek":
-        reasoning = str(message.get("reasoning_content") or "").strip()
-        if reasoning:
-            parsed = _router_parse_json_object(reasoning)
-            if parsed:
-                return json.dumps(parsed, ensure_ascii=False)
-            tail = reasoning[-4000:]
-            parsed = _router_parse_json_object(tail)
-            if parsed:
-                return json.dumps(parsed, ensure_ascii=False)
-
-    if family == "gemini":
-        parts = message.get("parts")
-        if isinstance(parts, list):
-            return _router_normalize_message_content(parts)
-
-    return ""
-
-
-def _router_parse_suggest_result(completion: dict[str, Any], model_id: str) -> dict[str, Any] | None:
-    content = _router_extract_assistant_content(completion, model_id)
-    if not content:
-        return None
-    parsed = _router_parse_json_object(content)
-    if not parsed:
-        return None
-    return parsed
-
-
-def _normalize_vietnamese_novel_status(raw: str | None) -> str:
-    allowed = ("Đang ra", "Hoàn thành", "Tạm ngưng")
-    s = " ".join((raw or "").split()).strip()
-    if s in allowed:
-        return s
-    low = s.lower()
-    if any(k in low for k in ("hoàn", "full", "complete", "end", "kết thúc")):
-        return "Hoàn thành"
-    if any(k in low for k in ("tạm ngưng", "drop", "hiatus", "đình chỉ")):
-        return "Tạm ngưng"
-    return "Đang ra"
-
-
-async def _router_pick_models() -> list[str]:
-    api_key = (settings.router_api_key or "").strip()
-
-    now = time.time()
-    if _ROUTER_MODEL_CACHE.get("expires_at", 0.0) > now:
-        return list(_ROUTER_MODEL_CACHE.get("models") or [])
-
-    candidates: list[tuple[int, str]] = []
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(
-                f"{str(settings.router_base_url).rstrip('/')}/models",
-                headers=headers,
-            )
-        response.raise_for_status()
-        models_payload = _router_parse_http_json(response.text)
-        for item in (models_payload.get("data") or []):
-            model_id = str(item.get("id") or "").strip()
-            if not model_id:
-                continue
-            low = model_id.lower()
-            if any(x in low for x in ["vision", "image", "audio", "realtime", "embedding", "moderation"]):
-                continue
-            candidates.append((_router_model_priority_score(model_id), model_id))
-    except Exception as exc:
-        logger.warning("router models list failed: %s", exc)
-        candidates = []
-
-    picked = _router_pick_models_from_candidates(candidates)
-    _ROUTER_MODEL_CACHE["models"] = picked
-    _ROUTER_MODEL_CACHE["expires_at"] = now + 600
-    return picked
-
-
-async def _router_ai_suggest(
-    title: str,
-    author: str,
-    chapters: list[dict[str, Any]],
-    existing_genres: list[str],
-) -> dict[str, Any] | None:
-    api_key = (settings.router_api_key or "").strip()
-
-    samples: list[str] = []
-    if chapters:
-        picks = [chapters[0]]
-        if len(chapters) > 2:
-            picks.append(chapters[len(chapters) // 2])
-        if len(chapters) > 1:
-            picks.append(chapters[-1])
-        for ch in picks:
-            snippet = str(ch.get("txt") or "")[:1200]
-            samples.append(f"Chapter {ch.get('number')}: {ch.get('title')}\n{snippet}")
-
-    system_prompt = (
-        "You are a Vietnamese fiction metadata assistant. "
-        "Return ONLY valid JSON (no markdown, no explanation) with exactly keys: genres, shortDescription, confidence, status. "
-        "genres must be an array of 1-6 concise Vietnamese labels. "
-        "You MAY invent NEW genre labels that are not listed in existingGenres when they fit the work better than any existing label; "
-        "still prefer existingGenres when there is a clear semantic match (synonym). "
-        "Do not output duplicates, slug format, or punctuation-only variants. "
-        "shortDescription must be 6-7 Vietnamese sentences, each sentence on a new line using newline characters. "
-        "Match tone and diction to the likely genre and make it emotionally engaging to increase reader curiosity. "
-        "No major spoilers, no quotes. "
-        "confidence must be a number from 0 to 1. "
-        "status must be EXACTLY one of these Vietnamese strings: \"Đang ra\", \"Hoàn thành\", \"Tạm ngưng\". "
-        "Infer status from chapter samples and typical serialization cues (complete arc vs cliffhanger vs hiatus markers); "
-        "when unsure, use \"Đang ra\"."
-    )
-    user_prompt = {
-        "title": title,
-        "author": author,
-        "chapterSamples": samples,
-        "existingGenres": existing_genres,
-        "requirements": {
-            "maxGenres": 6,
-            "allowNewGenres": True,
-            "preferExistingGenres": True,
-            "allowCreatingNewGenreRecords": True,
-            "language": "vi",
-        },
-    }
-
-    base_payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
-        ],
-        "temperature": 0.3,
-        "max_tokens": 650,
-        "response_format": {"type": "json_object"},
-    }
-
-    models = await _router_pick_models()
-    if not models:
-        return None
-    headers = {
-        "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:3000",
-        "X-Title": "reader-import-ai-suggest",
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    for model_id in models:
-        payload = dict(base_payload)
-        payload["model"] = model_id
-        family = _router_model_family(model_id)
-        try:
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                response = await client.post(
-                    f"{str(settings.router_base_url).rstrip('/')}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                )
-            if response.status_code >= 400:
-                logger.info(
-                    "router ai-suggest skip model=%s family=%s status=%s body=%s",
-                    model_id,
-                    family,
-                    response.status_code,
-                    (response.text or "")[:240],
-                )
-                continue
-            completion = _router_parse_completion_body(response.text, model_id=model_id)
-            parsed = _router_parse_suggest_result(completion, model_id)
-            if not parsed:
-                logger.info(
-                    "router ai-suggest skip model=%s family=%s reason=unparseable_content",
-                    model_id,
-                    family,
-                )
-                continue
-            raw_genres = [str(g).strip() for g in (parsed.get("genres") or []) if str(g).strip()][:6]
-            genres = _map_genres_to_existing(raw_genres, existing_genres, limit=6)
-            short_description = str(parsed.get("shortDescription") or "").strip()
-            novel_status = _normalize_vietnamese_novel_status(str(parsed.get("status") or "").strip())
-            try:
-                confidence = float(parsed.get("confidence") or 0.0)
-            except Exception:
-                confidence = 0.0
-            confidence = max(0.0, min(1.0, confidence))
-            if not short_description or not genres:
-                logger.info(
-                    "router ai-suggest skip model=%s family=%s reason=empty_fields genres=%s desc_len=%s",
-                    model_id,
-                    family,
-                    len(genres),
-                    len(short_description),
-                )
-                continue
-            return {
-                "suggestedGenres": genres,
-                "shortDescription": short_description,
-                "confidence": confidence,
-                "model": model_id,
-                "suggestedStatus": novel_status,
-            }
-        except Exception as exc:
-            logger.info(
-                "router ai-suggest skip model=%s family=%s reason=exception err=%s",
-                model_id,
-                family,
-                exc,
-            )
-            continue
-    return None
-
-
 async def _resolve_chapter_content(chapter_id: str, db: AsyncSession) -> str | None:
     ref_row = (
         await db.execute(
@@ -4025,6 +3628,21 @@ async def upload_epub_and_preview(
             pass
 
 
+@app.get("/api/mod/openrouter/models")
+async def mod_openrouter_models(
+    user: dict = Depends(require_current_user),
+):
+    if user.get("role") not in ("MOD", "ADMIN"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    catalog = await openrouter.fetch_models_catalog()
+    return {
+        "free": catalog.get("free") or [],
+        "paid": catalog.get("paid") or [],
+        "selectedForSuggest": catalog.get("selectedForSuggest") or [],
+        "cacheExpiresAt": catalog.get("cacheExpiresAt"),
+    }
+
+
 @app.post("/api/mod/epub/ai-suggest")
 async def mod_epub_ai_suggest(
     file: UploadFile = File(...),
@@ -4063,14 +3681,22 @@ async def mod_epub_ai_suggest(
             if str(r.get("name") or "").strip()
         ]
 
-        ai_result = await _router_ai_suggest(resolved_title, resolved_author, chapters, existing_genres)
+        ai_result = await openrouter.ai_suggest_epub(
+            resolved_title,
+            resolved_author,
+            chapters,
+            existing_genres,
+            genre_hints=list(meta.get("genres") or []),
+            map_genres=lambda candidates, existing: _map_genres_to_existing(candidates, existing, limit=6),
+        )
         if ai_result:
             return {
                 "suggestedGenres": ai_result["suggestedGenres"][:6],
                 "shortDescription": ai_result["shortDescription"],
                 "confidence": ai_result["confidence"],
-                "source": "router_dynamic",
+                "source": "openrouter",
                 "model": ai_result.get("model"),
+                "modelTier": ai_result.get("modelTier"),
                 "suggestedStatus": ai_result.get("suggestedStatus") or "Đang ra",
             }
 
