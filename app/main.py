@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user, verify_google_id_token
+from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user, resolve_current_user, verify_google_id_token
 from app.config import settings
 from app.database import get_db_session
 from app import openrouter
@@ -95,6 +95,18 @@ async def _ensure_migration_tables() -> None:
         'DROP TABLE IF EXISTS "Comment" CASCADE',
         'DROP TABLE IF EXISTS "UserRecommendationDoc" CASCADE',
         'DROP TABLE IF EXISTS "EditorRecommendationDoc" CASCADE',
+        '''
+        CREATE TABLE IF NOT EXISTS "NovelRating" (
+            id TEXT PRIMARY KEY,
+            "userId" TEXT NOT NULL,
+            "novelId" TEXT NOT NULL,
+            score DOUBLE PRECISION NOT NULL,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE("userId", "novelId")
+        )
+        ''',
+        'CREATE INDEX IF NOT EXISTS "NovelRating_novelId_idx" ON "NovelRating"("novelId")',
     ]
     async with engine.begin() as conn:
         for ddl in migration_ddls:
@@ -1921,7 +1933,11 @@ async def browse_novels(
 
 
 @app.get("/api/novels/{id_or_slug}")
-async def get_novel_detail(id_or_slug: str, db: AsyncSession = Depends(get_db_session)):
+async def get_novel_detail(
+    id_or_slug: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+):
     row = (
         await db.execute(
             text(
@@ -1952,7 +1968,12 @@ async def get_novel_detail(id_or_slug: str, db: AsyncSession = Depends(get_db_se
         )
     ).mappings().all()
 
-    return {
+    user = await resolve_current_user(db, request)
+    user_rating = None
+    if user:
+        user_rating = await _load_user_novel_rating(db, user["id"], row["id"])
+
+    payload = {
         "id": row["id"],
         "title": row["title"],
         "slug": row["slug"],
@@ -1972,6 +1993,9 @@ async def get_novel_detail(id_or_slug: str, db: AsyncSession = Depends(get_db_se
         "createdAt": _iso(row["createdAt"]),
         "updatedAt": _iso(row["updatedAt"]),
     }
+    if user_rating is not None:
+        payload["userRating"] = user_rating
+    return payload
 
 
 @app.get("/api/truyen/{novel_id}/chapters")
@@ -2139,6 +2163,39 @@ async def suggest_novels(q: str = "", db: AsyncSession = Depends(get_db_session)
 
 class RatePayload(BaseModel):
     score: float = Field(ge=1, le=10)
+
+
+async def _recalculate_novel_rating(db: AsyncSession, novel_id: str) -> tuple[float, int]:
+    row = (
+        await db.execute(
+            text(
+                'SELECT COALESCE(AVG(score), 0) AS avg_score, COUNT(*)::int AS cnt '
+                'FROM "NovelRating" WHERE "novelId" = :novel_id'
+            ),
+            {"novel_id": novel_id},
+        )
+    ).mappings().first()
+    avg_score = float(row["avg_score"] or 0)
+    count = int(row["cnt"] or 0)
+    await db.execute(
+        text('UPDATE "Novel" SET rating = :rating, "ratingCount" = :count WHERE id = :novel_id'),
+        {"rating": avg_score, "count": count, "novel_id": novel_id},
+    )
+    return avg_score, count
+
+
+async def _load_user_novel_rating(db: AsyncSession, user_id: str, novel_id: str) -> float | None:
+    row = (
+        await db.execute(
+            text(
+                'SELECT score FROM "NovelRating" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'
+            ),
+            {"user_id": user_id, "novel_id": novel_id},
+        )
+    ).mappings().first()
+    if not row:
+        return None
+    return float(row["score"])
 
 
 class ModGenrePayload(BaseModel):
@@ -3245,26 +3302,76 @@ async def mod_epub_ai_suggest(
             pass
 
 
+@app.get("/api/truyen/{novel_id}/rate")
+async def get_user_novel_rating(
+    novel_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+):
+    user = await require_current_user(request, db)
+    novel_exists = (
+        await db.execute(text('SELECT id FROM "Novel" WHERE id = :novel_id LIMIT 1'), {"novel_id": novel_id})
+    ).mappings().first()
+    if not novel_exists:
+        raise HTTPException(status_code=404, detail="Novel not found")
+
+    user_rating = await _load_user_novel_rating(db, user["id"], novel_id)
+    return {"userRating": user_rating}
+
+
 @app.post("/api/truyen/{novel_id}/rate")
-async def rate_novel(novel_id: str, payload: RatePayload, db: AsyncSession = Depends(get_db_session)):
-    row = (
+async def rate_novel(
+    novel_id: str,
+    payload: RatePayload,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+):
+    user = await require_current_user(request, db)
+
+    novel_exists = (
+        await db.execute(text('SELECT id FROM "Novel" WHERE id = :novel_id LIMIT 1'), {"novel_id": novel_id})
+    ).mappings().first()
+    if not novel_exists:
+        raise HTTPException(status_code=404, detail="Novel not found")
+
+    existing = (
         await db.execute(
             text(
-                'UPDATE "Novel" '
-                'SET "ratingCount" = "ratingCount" + 1, '
-                'rating = ((rating * "ratingCount") + :score) / ("ratingCount" + 1) '
-                'WHERE id = :novel_id '
-                'RETURNING rating, "ratingCount"'
+                'SELECT id FROM "NovelRating" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'
             ),
-            {"score": payload.score, "novel_id": novel_id},
+            {"user_id": user["id"], "novel_id": novel_id},
         )
     ).mappings().first()
 
-    if not row:
-        raise HTTPException(status_code=404, detail="Novel not found")
+    if existing:
+        await db.execute(
+            text(
+                'UPDATE "NovelRating" SET score = :score, "updatedAt" = NOW() WHERE id = :rating_id'
+            ),
+            {"score": payload.score, "rating_id": existing["id"]},
+        )
+    else:
+        await db.execute(
+            text(
+                'INSERT INTO "NovelRating"(id, "userId", "novelId", score, "createdAt", "updatedAt") '
+                'VALUES (:id, :user_id, :novel_id, :score, NOW(), NOW())'
+            ),
+            {
+                "id": _new_id("nr_"),
+                "user_id": user["id"],
+                "novel_id": novel_id,
+                "score": payload.score,
+            },
+        )
 
+    avg_rating, rating_count = await _recalculate_novel_rating(db, novel_id)
     await db.commit()
-    return {"rating": float(row["rating"] or 0), "ratingCount": int(row["ratingCount"] or 0)}
+
+    return {
+        "rating": avg_rating,
+        "ratingCount": rating_count,
+        "userRating": payload.score,
+    }
 
 
 

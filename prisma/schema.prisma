@@ -46,6 +46,7 @@ model User {
   accounts      Account[]
   sessions      Session[]
   bookmarks     Bookmark[]
+  novelRatings    NovelRating[]
   novels        Novel[]   @relation("AuthorNovels") // Truyện do người này (MOD/ADMIN) đăng
   settings      UserSetting?
 }
@@ -98,10 +99,26 @@ model Novel {
   
   genres        NovelGenre[]
   bookmarks     Bookmark[]
+  ratings       NovelRating[]
   dailyViews    NovelViewDaily[]
 
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+}
+
+model NovelRating {
+  id        String   @id @default(cuid())
+  userId    String
+  novelId   String
+  score     Float
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  novel Novel @relation(fields: [novelId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, novelId])
+  @@index([novelId])
 }
 
 model NovelViewDaily {
