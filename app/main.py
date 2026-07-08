@@ -2165,7 +2165,29 @@ class RatePayload(BaseModel):
     score: float = Field(ge=1, le=10)
 
 
+async def _ensure_novel_rating_table(db: AsyncSession) -> None:
+    await db.execute(
+        text(
+            '''
+            CREATE TABLE IF NOT EXISTS "NovelRating" (
+                id TEXT PRIMARY KEY,
+                "userId" TEXT NOT NULL,
+                "novelId" TEXT NOT NULL,
+                score DOUBLE PRECISION NOT NULL,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE("userId", "novelId")
+            )
+            '''
+        )
+    )
+    await db.execute(
+        text('CREATE INDEX IF NOT EXISTS "NovelRating_novelId_idx" ON "NovelRating"("novelId")')
+    )
+
+
 async def _recalculate_novel_rating(db: AsyncSession, novel_id: str) -> tuple[float, int]:
+    await _ensure_novel_rating_table(db)
     row = (
         await db.execute(
             text(
@@ -2185,14 +2207,19 @@ async def _recalculate_novel_rating(db: AsyncSession, novel_id: str) -> tuple[fl
 
 
 async def _load_user_novel_rating(db: AsyncSession, user_id: str, novel_id: str) -> float | None:
-    row = (
-        await db.execute(
-            text(
-                'SELECT score FROM "NovelRating" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'
-            ),
-            {"user_id": user_id, "novel_id": novel_id},
-        )
-    ).mappings().first()
+    try:
+        await _ensure_novel_rating_table(db)
+        row = (
+            await db.execute(
+                text(
+                    'SELECT score FROM "NovelRating" WHERE "userId" = :user_id AND "novelId" = :novel_id LIMIT 1'
+                ),
+                {"user_id": user_id, "novel_id": novel_id},
+            )
+        ).mappings().first()
+    except Exception:
+        logger.exception("Failed to load user novel rating user=%s novel=%s", user_id, novel_id)
+        return None
     if not row:
         return None
     return float(row["score"])
@@ -3315,6 +3342,7 @@ async def get_user_novel_rating(
     if not novel_exists:
         raise HTTPException(status_code=404, detail="Novel not found")
 
+    await _ensure_novel_rating_table(db)
     user_rating = await _load_user_novel_rating(db, user["id"], novel_id)
     return {"userRating": user_rating}
 
@@ -3334,6 +3362,7 @@ async def rate_novel(
     if not novel_exists:
         raise HTTPException(status_code=404, detail="Novel not found")
 
+    await _ensure_novel_rating_table(db)
     existing = (
         await db.execute(
             text(
