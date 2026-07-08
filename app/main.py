@@ -42,8 +42,32 @@ logger = logging.getLogger(__name__)
 MOD_EPUB_MAX_CHAPTERS = 4000
 
 
+async def _ensure_novel_rating_table() -> None:
+    from app.database import engine
+
+    ddl_statements = [
+        '''
+        CREATE TABLE IF NOT EXISTS "NovelRating" (
+            id TEXT PRIMARY KEY,
+            "userId" TEXT NOT NULL,
+            "novelId" TEXT NOT NULL,
+            score DOUBLE PRECISION NOT NULL,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE("userId", "novelId")
+        )
+        ''',
+        'CREATE INDEX IF NOT EXISTS "NovelRating_novelId_idx" ON "NovelRating"("novelId")',
+    ]
+
+    async with engine.begin() as conn:
+        for ddl in ddl_statements:
+            await conn.execute(text(ddl))
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    await _ensure_novel_rating_table()
     if str(settings.auto_schema_bootstrap).lower() in {"1", "true", "yes", "on"}:
         await _ensure_migration_tables()
     yield
@@ -2165,29 +2189,7 @@ class RatePayload(BaseModel):
     score: float = Field(ge=1, le=10)
 
 
-async def _ensure_novel_rating_table(db: AsyncSession) -> None:
-    await db.execute(
-        text(
-            '''
-            CREATE TABLE IF NOT EXISTS "NovelRating" (
-                id TEXT PRIMARY KEY,
-                "userId" TEXT NOT NULL,
-                "novelId" TEXT NOT NULL,
-                score DOUBLE PRECISION NOT NULL,
-                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE("userId", "novelId")
-            )
-            '''
-        )
-    )
-    await db.execute(
-        text('CREATE INDEX IF NOT EXISTS "NovelRating_novelId_idx" ON "NovelRating"("novelId")')
-    )
-
-
 async def _recalculate_novel_rating(db: AsyncSession, novel_id: str) -> tuple[float, int]:
-    await _ensure_novel_rating_table(db)
     row = (
         await db.execute(
             text(
@@ -2208,7 +2210,6 @@ async def _recalculate_novel_rating(db: AsyncSession, novel_id: str) -> tuple[fl
 
 async def _load_user_novel_rating(db: AsyncSession, user_id: str, novel_id: str) -> float | None:
     try:
-        await _ensure_novel_rating_table(db)
         row = (
             await db.execute(
                 text(
@@ -3342,7 +3343,6 @@ async def get_user_novel_rating(
     if not novel_exists:
         raise HTTPException(status_code=404, detail="Novel not found")
 
-    await _ensure_novel_rating_table(db)
     user_rating = await _load_user_novel_rating(db, user["id"], novel_id)
     return {"userRating": user_rating}
 
@@ -3362,7 +3362,6 @@ async def rate_novel(
     if not novel_exists:
         raise HTTPException(status_code=404, detail="Novel not found")
 
-    await _ensure_novel_rating_table(db)
     existing = (
         await db.execute(
             text(
