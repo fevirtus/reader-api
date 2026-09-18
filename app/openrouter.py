@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 _MODEL_CACHE: dict[str, Any] = {"expires_at": 0.0, "catalog": None}
 _CACHE_TTL_SECONDS = 600
+_MODEL_COOLDOWN: dict[str, float] = {}
+_COOLDOWN_HTTP_STATUSES = frozenset({400, 401, 402, 404, 429})
 
 _EXCLUDED_ID_FRAGMENTS = ("vision", "image", "audio", "realtime", "embedding", "moderation")
 
@@ -23,9 +25,11 @@ _LLM_ARTIFACT_RE = re.compile(
     re.IGNORECASE,
 )
 _CORRUPTED_DE_FRAGMENT_RE = re.compile(r"(?<=\S)\s+de\s+(?=\S)", re.IGNORECASE)
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…。])\s+")
 _SHORT_DESC_MIN_SENTENCES = 4
 _SHORT_DESC_MAX_SENTENCES = 12
 _SHORT_DESC_MIN_SENTENCE_LEN = 10
+_SUGGEST_MAX_TOKENS = 1800
 
 
 def sanitize_llm_vietnamese_text(text: str) -> str:
@@ -41,6 +45,18 @@ def sanitize_llm_vietnamese_text(text: str) -> str:
     return "\n".join(lines)
 
 
+def _split_sentences(text: str) -> list[str]:
+    compact = re.sub(r"\s+", " ", (text or "").strip())
+    if not compact:
+        return []
+    return [part.strip() for part in _SENTENCE_SPLIT_RE.split(compact) if part.strip()]
+
+
+def normalize_short_description_sentences(text: str) -> str:
+    """Normalize to one sentence per line for consistent storage/UI."""
+    return "\n".join(_split_sentences(text))
+
+
 def validate_short_description(text: str) -> str | None:
     """Return rejection reason, or None when the description looks publishable."""
     if not text.strip():
@@ -53,18 +69,18 @@ def validate_short_description(text: str) -> str | None:
     if _CORRUPTED_DE_FRAGMENT_RE.search(text):
         return "corrupted_word_fragment"
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if len(lines) < _SHORT_DESC_MIN_SENTENCES:
+    sentences = _split_sentences(text)
+    if len(sentences) < _SHORT_DESC_MIN_SENTENCES:
         return "too_few_sentences"
-    if len(lines) > _SHORT_DESC_MAX_SENTENCES:
+    if len(sentences) > _SHORT_DESC_MAX_SENTENCES:
         return "too_many_sentences"
 
-    for line in lines:
-        if len(line) < _SHORT_DESC_MIN_SENTENCE_LEN:
+    for sentence in sentences:
+        if len(sentence) < _SHORT_DESC_MIN_SENTENCE_LEN:
             return "sentence_too_short"
-        if line.endswith("..."):
+        if sentence.endswith("..."):
             return "truncated_sentence"
-        if re.search(r"\s{2,}", line):
+        if re.search(r"\s{2,}", sentence):
             return "irregular_spacing"
 
     compact = re.sub(r"\s+", "", text)
@@ -137,6 +153,30 @@ def _model_family(model_id: str) -> str:
     if "gemini" in low or "google" in low:
         return "gemini"
     return "other"
+
+
+def _cooldown_seconds() -> float:
+    return float(max(60, int(settings.router_model_cooldown_seconds or 1200)))
+
+
+def _mark_model_cooldown(model_id: str) -> None:
+    mid = (model_id or "").strip()
+    if not mid:
+        return
+    _MODEL_COOLDOWN[mid] = time.time() + _cooldown_seconds()
+
+
+def _is_model_cooling(model_id: str) -> bool:
+    mid = (model_id or "").strip()
+    if not mid:
+        return False
+    until = _MODEL_COOLDOWN.get(mid)
+    if until is None:
+        return False
+    if until <= time.time():
+        _MODEL_COOLDOWN.pop(mid, None)
+        return False
+    return True
 
 
 def _serialize_model_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -374,6 +414,33 @@ def _partition_models(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
     return free_models, paid_models
 
 
+def _take_serialized_models(
+    raw_items: list[dict[str, Any]],
+    *,
+    limit: int,
+    require_structured: bool,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    selected: list[dict[str, Any]] = []
+    for item in raw_items:
+        if require_structured and not _supports_structured_output(item):
+            continue
+        selected.append(_serialize_model_item(item))
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _empty_catalog() -> dict[str, Any]:
+    return {
+        "free": [],
+        "paid": [],
+        "selectedForSuggest": [],
+        "cacheExpiresAt": None,
+    }
+
+
 async def fetch_models_catalog(*, force_refresh: bool = False) -> dict[str, Any]:
     now = time.time()
     cached = _MODEL_CACHE.get("catalog")
@@ -383,13 +450,7 @@ async def fetch_models_catalog(*, force_refresh: bool = False) -> dict[str, Any]
     api_key = (settings.router_api_key or "").strip()
     if not api_key:
         logger.warning("OpenRouter API key missing; model catalog unavailable")
-        empty = {
-            "free": [],
-            "paid": [],
-            "selectedForSuggest": [],
-            "cacheExpiresAt": None,
-        }
-        return empty
+        return _empty_catalog()
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -403,16 +464,36 @@ async def fetch_models_catalog(*, force_refresh: bool = False) -> dict[str, Any]
         raw_items = [item for item in (models_payload.get("data") or []) if isinstance(item, dict)]
     except Exception as exc:
         logger.warning("OpenRouter models list failed: %s", exc)
-        raw_items = []
+        if cached:
+            logger.warning("OpenRouter using stale model catalog after list failure")
+            return cached
+        return _empty_catalog()
+
+    if not raw_items:
+        logger.warning("OpenRouter models list returned empty")
+        if cached:
+            logger.warning("OpenRouter using stale model catalog after empty list")
+            return cached
+        return _empty_catalog()
 
     free_raw, paid_raw = _partition_models(raw_items)
     free_limit = max(1, int(settings.router_free_pick_limit or 5))
-    paid_limit = max(0, int(settings.router_paid_pick_limit or 3))
+    paid_limit = max(0, int(settings.router_paid_pick_limit or 4))
 
-    free_models = [_serialize_model_item(item) for item in free_raw[:free_limit]]
-    paid_models = [_serialize_model_item(item) for item in paid_raw[:paid_limit]]
+    free_models = _take_serialized_models(free_raw, limit=free_limit, require_structured=True)
+    paid_models = _take_serialized_models(paid_raw, limit=paid_limit, require_structured=True)
+    if not free_models and not paid_models:
+        logger.info("OpenRouter no structured-output models; falling back to any text-chat models")
+        free_models = _take_serialized_models(free_raw, limit=free_limit, require_structured=False)
+        paid_models = _take_serialized_models(paid_raw, limit=paid_limit, require_structured=False)
+
+    if not free_models and not paid_models:
+        logger.warning("OpenRouter catalog partitioned to zero models")
+        if cached:
+            return cached
+        return _empty_catalog()
+
     selected = [m["id"] for m in free_models] + [m["id"] for m in paid_models]
-
     catalog = {
         "free": free_models,
         "paid": paid_models,
@@ -424,17 +505,19 @@ async def fetch_models_catalog(*, force_refresh: bool = False) -> dict[str, Any]
     return catalog
 
 
-async def pick_models_for_suggest() -> list[tuple[str, str]]:
+async def pick_models_for_suggest() -> list[tuple[str, str, bool]]:
+    """Return (model_id, tier, supports_structured_output), skipping cooldown models."""
     catalog = await fetch_models_catalog()
-    picked: list[tuple[str, str]] = []
-    for item in catalog.get("free") or []:
+    picked: list[tuple[str, str, bool]] = []
+    for item in (catalog.get("free") or []) + (catalog.get("paid") or []):
         model_id = str(item.get("id") or "").strip()
-        if model_id:
-            picked.append((model_id, "free"))
-    for item in catalog.get("paid") or []:
-        model_id = str(item.get("id") or "").strip()
-        if model_id:
-            picked.append((model_id, "paid"))
+        if not model_id:
+            continue
+        if _is_model_cooling(model_id):
+            continue
+        tier = str(item.get("tier") or "paid")
+        supports = bool(item.get("supportsStructuredOutput"))
+        picked.append((model_id, tier, supports))
     return picked
 
 
@@ -463,6 +546,10 @@ def _pick_chapter_samples(chapters: list[dict[str, Any]], *, snippet_len: int = 
         snippet = str(ch.get("txt") or "")[:snippet_len]
         samples.append(f"Chapter {ch.get('number')}: {ch.get('title')}\n{snippet}")
     return samples
+
+
+def _record_skip(skip_counts: dict[str, int], reason: str) -> None:
+    skip_counts[reason] = skip_counts.get(reason, 0) + 1
 
 
 async def ai_suggest_epub(
@@ -520,17 +607,23 @@ async def ai_suggest_epub(
             {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
         ],
         "temperature": 0.25,
-        "max_tokens": 1000,
-        "response_format": {"type": "json_object"},
+        "max_tokens": _SUGGEST_MAX_TOKENS,
     }
 
     models = await pick_models_for_suggest()
     if not models:
+        logger.info("openrouter ai-suggest done tried=0 result=fallback skips={'no_models': 1}")
         return None
 
-    for model_id, tier in models:
+    skip_counts: dict[str, int] = {}
+    tried = 0
+
+    for model_id, tier, supports_structured in models:
+        tried += 1
         payload = dict(base_payload)
         payload["model"] = model_id
+        if supports_structured:
+            payload["response_format"] = {"type": "json_object"}
         family = _model_family(model_id)
         try:
             async with httpx.AsyncClient(timeout=45.0) as client:
@@ -540,6 +633,10 @@ async def ai_suggest_epub(
                     json=payload,
                 )
             if response.status_code >= 400:
+                reason = f"status_{response.status_code}"
+                _record_skip(skip_counts, reason)
+                if response.status_code in _COOLDOWN_HTTP_STATUSES:
+                    _mark_model_cooldown(model_id)
                 logger.info(
                     "openrouter ai-suggest skip model=%s tier=%s family=%s status=%s body=%s",
                     model_id,
@@ -552,6 +649,7 @@ async def ai_suggest_epub(
             completion = _parse_completion_body(response.text, model_id=model_id)
             parsed = _parse_suggest_result(completion, model_id)
             if not parsed:
+                _record_skip(skip_counts, "unparseable_content")
                 logger.info(
                     "openrouter ai-suggest skip model=%s tier=%s family=%s reason=unparseable_content",
                     model_id,
@@ -570,6 +668,7 @@ async def ai_suggest_epub(
                 confidence = 0.0
             confidence = max(0.0, min(1.0, confidence))
             if not short_description or not genres:
+                _record_skip(skip_counts, "empty_fields")
                 logger.info(
                     "openrouter ai-suggest skip model=%s tier=%s family=%s reason=empty_fields genres=%s desc_len=%s",
                     model_id,
@@ -580,6 +679,7 @@ async def ai_suggest_epub(
                 )
                 continue
             if quality_issue:
+                _record_skip(skip_counts, f"quality_{quality_issue}")
                 logger.info(
                     "openrouter ai-suggest skip model=%s tier=%s family=%s reason=quality_%s desc_len=%s",
                     model_id,
@@ -589,6 +689,14 @@ async def ai_suggest_epub(
                     len(short_description),
                 )
                 continue
+            short_description = normalize_short_description_sentences(short_description)
+            logger.info(
+                "openrouter ai-suggest done tried=%s result=%s tier=%s skips=%s",
+                tried,
+                model_id,
+                tier,
+                skip_counts or {},
+            )
             return {
                 "suggestedGenres": genres,
                 "shortDescription": short_description,
@@ -598,6 +706,8 @@ async def ai_suggest_epub(
                 "suggestedStatus": novel_status,
             }
         except Exception as exc:
+            _record_skip(skip_counts, "exception")
+            _mark_model_cooldown(model_id)
             logger.info(
                 "openrouter ai-suggest skip model=%s tier=%s family=%s reason=exception err=%s",
                 model_id,
@@ -606,4 +716,10 @@ async def ai_suggest_epub(
                 exc,
             )
             continue
+
+    logger.info(
+        "openrouter ai-suggest done tried=%s result=fallback skips=%s",
+        tried,
+        skip_counts or {},
+    )
     return None

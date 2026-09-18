@@ -27,7 +27,8 @@ class Settings(BaseSettings):
     router_api_key: str = ""
     router_base_url: str = "https://openrouter.ai/api/v1"
     router_free_pick_limit: int = 5
-    router_paid_pick_limit: int = 3
+    router_paid_pick_limit: int = 4
+    router_model_cooldown_seconds: int = 1200
 
     @property
     def google_client_id_list(self) -> list[str]:
