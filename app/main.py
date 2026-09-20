@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_current_user, resolve_current_user, verify_google_id_token
 from app.config import settings
 from app.database import get_db_session
-from app import openrouter
+from app import deepseek
 from app.storage import storage
 
 logger = logging.getLogger(__name__)
@@ -3242,21 +3242,6 @@ async def upload_epub_and_preview(
             pass
 
 
-@app.get("/api/mod/openrouter/models")
-async def mod_openrouter_models(
-    user: dict = Depends(require_current_user),
-):
-    if user.get("role") not in ("MOD", "ADMIN"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    catalog = await openrouter.fetch_models_catalog()
-    return {
-        "free": catalog.get("free") or [],
-        "paid": catalog.get("paid") or [],
-        "selectedForSuggest": catalog.get("selectedForSuggest") or [],
-        "cacheExpiresAt": catalog.get("cacheExpiresAt"),
-    }
-
-
 @app.post("/api/mod/epub/ai-suggest")
 async def mod_epub_ai_suggest(
     file: UploadFile = File(...),
@@ -3295,7 +3280,7 @@ async def mod_epub_ai_suggest(
             if str(r.get("name") or "").strip()
         ]
 
-        ai_result = await openrouter.ai_suggest_epub(
+        ai_result = await deepseek.ai_suggest_epub(
             resolved_title,
             resolved_author,
             chapters,
@@ -3308,9 +3293,8 @@ async def mod_epub_ai_suggest(
                 "suggestedGenres": ai_result["suggestedGenres"][:6],
                 "shortDescription": ai_result["shortDescription"],
                 "confidence": ai_result["confidence"],
-                "source": "openrouter",
+                "source": "deepseek",
                 "model": ai_result.get("model"),
-                "modelTier": ai_result.get("modelTier"),
                 "suggestedStatus": ai_result.get("suggestedStatus") or "Đang ra",
             }
 
