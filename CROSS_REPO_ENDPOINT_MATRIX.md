@@ -1,42 +1,52 @@
-# Cross-Repo Endpoint Mapping Matrix
+# Đối chiếu API giữa web và mobile
 
-Muc tieu: map 1-1 giua API backend, Web va Mobile cho user-facing flows.
+Bản đối chiếu được giữ tại `reader-api`, dựa trên các call site trong code.
+“Đã dùng” chỉ xác nhận tích hợp trong source, không thay thế kiểm thử end-to-end.
 
-Legend:
-- `Y`: da tich hop
-- `P`: partial / can verify them
-- `N`: chua tich hop
+## Luồng chung đã tích hợp
 
-| Domain | Endpoint | API | Web | Mobile | Notes |
-|---|---|---|---|---|---|
-| Health | `GET /api/health` | Y | P | P | Dung cho monitor, khong phai main UI flow |
-| Auth | `POST /api/auth/mobile-login` | Y | Y | Y | Web dung route adapter login, mobile dung JWT |
-| User | `GET /api/user/profile` | Y | P | Y | Web dang goi qua user route proxy |
-| User | `GET/POST /api/user/bookmarks` | Y | Y | Y | `markAsRead`, `updateProgress`; khong con `toggle` |
-| User | `DELETE /api/user/bookmarks/{novelId}` | Y | Y | Y | Xoa khoi tu sach |
-| User | `POST /api/user/reading-progress` | Y | P | Y | Mobile dung endpoint nay; web dung `updateProgress` qua bookmarks |
-| User | `GET/POST /api/user/settings` | Y | Y | N | Mobile chua thay call settings ro rang |
-| Catalog | `GET /api/genres` | Y | Y | Y | |
-| Catalog | `GET /api/novels/browse` | Y | Y | Y | Co `latestChapter` trong response |
-| Catalog | `GET /api/novels/{idOrSlug}` | Y | Y | Y | |
-| Novel | `GET /api/truyen/{id}/chapters` | Y | Y | Y | |
-| Novel | `GET /api/truyen/{id}/chapters/by-number/{n}` | Y | Y | N | Mobile doc chapter theo chapterId endpoint |
-| Chapter | `GET /api/chapters/{chapterId}` | Y | N | Y | Web doc chapter qua truyen/by-number |
-| Rating | `POST /api/truyen/{id}/rate` | Y | Y | Y | Thang diem 1-10, hien thi 5 sao (nua sao) |
-| Search | `GET /api/truyen/suggest` | Y | Y | N | Mobile search suggest can bo sung |
-| Import | `POST /api/import/uploads/preview` | Y | Y | N | Upload EPUB multipart (preview) |
-| Import | `POST /api/mod/epub`, `POST /api/mod/epub/ai-suggest` | Y | Y | N | Luong `/mod/import` |
-| Import | `GET/POST/PUT/DELETE /api/mod/the-loai` | Y | Y | N | MOD quan ly the loai trong wizard |
+- Login: cả hai dùng `POST /api/auth/mobile-login`; web đi qua route adapter
+  `/api/auth/login` và dùng cookie, mobile dùng Bearer JWT.
+- Session/profile: web dùng `GET /api/auth/session`; mobile hydrate user qua
+  `GET /api/user/profile`.
+- Khám phá/tìm kiếm: `/api/genres`, `/api/novels/browse`,
+  `/api/novels/{id_or_slug}`.
+- Mục lục: `GET /api/truyen/{novel_id}/chapters`.
+- Tủ sách: `GET/POST /api/user/bookmarks`,
+  `DELETE /api/user/bookmarks/{novel_id}`; có đánh dấu đã đọc.
+- Rating: `GET/POST /api/truyen/{novel_id}/rate`, thang điểm 1–10.
 
-## Da loai bo
+## Khác nhau theo client
 
-- Comment (`/api/truyen/{id}/comments`)
-- User/Editor recommendations (`/api/user/recommendations`, `/api/mod/de-cu`)
-- Admin truyen thieu du lieu (`/api/mod/truyen/missing`)
-- Bookmark toggle (danh dau khong tien do)
+Web đọc chương theo số chương qua
+`/api/truyen/{novel_id}/chapters/by-number/{chapter_number}`;
+mobile đọc theo ID qua `/api/chapters/{chapter_id}`.
 
-## Priority gaps de dong bo tiep
+Web cập nhật tiến độ bằng action `updateProgress` trên bookmarks;
+mobile dùng `/api/user/reading-progress`. Backend dùng chung logic ghi tiến độ
+chương cho hai cách gọi. Vị trí cuộn của mobile chỉ lưu local.
 
-1. Mobile: `user/settings`, `suggest`.
-2. Web/Mobile chapter-read strategy can unify (`chapters/{id}` vs `by-number`).
-3. Chuan hoa error contract implementation theo `CONTRACT.md`.
+Web dùng `/api/user/settings` và `/api/truyen/suggest`.
+Mobile chưa gọi hai endpoint này; settings lưu local, tìm kiếm qua browse API.
+Đây là hai khoảng trống so với mục tiêu tương đương tính năng người đọc.
+
+Mobile có TTS, cache Drift/SQLite và tải nội dung để đọc offline.
+Các khả năng này là phần riêng của app, không đồng nghĩa toàn bộ dữ liệu và
+thao tác offline đã có cơ chế đồng bộ lại lên server.
+
+## Chỉ có trên web theo phạm vi sản phẩm
+
+MOD/ADMIN quản lý truyện, chương, thể loại, ảnh bìa qua `/api/mod/*`.
+Import dùng `POST /api/import/uploads/preview`, `POST /api/mod/epub/ai-suggest`
+và `POST /api/mod/epub`. Mobile không có giao diện quản trị/import.
+
+## Khi thay đổi tính năng
+
+Đối chiếu request/response, auth, lỗi và state của các client liên quan.
+Không yêu cầu mọi client gọi cùng một endpoint nếu cùng nghiệp vụ đã được
+backend xử lý nhất quán. Không mở lại comments hoặc recommendations dựa trên
+tài liệu cũ; hai nhóm này đã bị loại khỏi phạm vi hiện tại.
+
+Xem [contract](CONTRACT.md), [web](../reader/README.md) và
+[mobile](../reader-app/README.md). Các liên kết sang client giả định checkout
+ba repo cạnh nhau.

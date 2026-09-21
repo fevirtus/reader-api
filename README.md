@@ -1,213 +1,113 @@
-# reader-api (FastAPI + UV)
+# Reader API
 
-Shared backend API for both:
-- Web app: reader
-- Mobile app: reader-app
+Backend FastAPI dùng chung cho web `reader` và ứng dụng Flutter `reader-app`.
+Mục tiêu là dùng chung tài khoản, kho truyện, tủ sách và tiến độ đọc;
+nghiệp vụ và phân quyền được xử lý tập trung ở API.
 
-This project is Python-first (FastAPI), with production-focused Docker setup and healthcheck.
+## Phạm vi và cấu trúc
 
-## Stack
+- `app/main.py`: endpoint đọc truyện, tìm kiếm, rating, user và quản lý nội dung.
+- `app/auth.py`: xác minh Google ID token, cấp JWT và xác thực cookie/Bearer token.
+- `app/database.py`: PostgreSQL qua SQLAlchemy async và asyncpg.
+- `app/storage.py`: đọc/ghi nội dung chương trong thư mục local hoặc NAS mount.
+- `app/epub_parser.py`: phân tích EPUB; `app/deepseek.py`: gợi ý metadata bằng AI.
 
-- Python 3.11+
-- FastAPI
-- UV (package manager / runner)
-- PostgreSQL (metadata, user data, chapter refs; chapter text stored via NAS/files — see `NAS_CONTENT_ROOT` / storage layer)
+PostgreSQL lưu user, truyện, thể loại, rating, bookmarks, settings,
+`ChapterMeta` và `ChapterContentRef`. Nội dung chương được lưu dạng text/HTML
+trên file storage; ảnh bìa upload qua Cloudflare R2.
 
-## API Base URL
+Web cung cấp giao diện MOD/ADMIN: quản lý truyện/chương/thể loại, sửa nội dung,
+upload bìa và import EPUB. Mobile chỉ phục vụ người đọc.
+Bình luận, đề cử và các endpoint SourceAsset/import-job cũ đã bị gỡ.
 
-- Local dev: http://localhost:8000
-- Healthcheck: GET /api/health
+## Chạy local
 
-## Environment
-
-Create `.env` from `.env.example`.
-
-Required keys:
-
-```env
-DATABASE_URL=postgresql://reader:reader@localhost:5432/reader
-NEXTAUTH_SECRET=replace-with-strong-secret
-MOBILE_JWT_SECRET=replace-with-strong-secret
-# Comma-separated allowed Google OAuth client IDs
-GOOGLE_CLIENT_ID=web-client-id.apps.googleusercontent.com,android-client-id.apps.googleusercontent.com
-CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-APP_ENV=development
-```
-
-## Dev Setup (UV)
-
-1. Install UV
+Cần Python 3.11+, uv và PostgreSQL có schema phù hợp.
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-2. Sync dependencies
-
-```bash
+cp .env.example .env
 uv sync
-```
-
-3. Run API in dev mode
-
-```bash
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-4. Verify health
+Các cấu hình chính trong `.env`:
 
-```bash
-curl http://localhost:8000/api/health
-```
+- `DATABASE_URL`: PostgreSQL của hệ thống Reader.
+- `MOBILE_JWT_SECRET`: khóa ký access token; code dùng `NEXTAUTH_SECRET` làm fallback.
+- `GOOGLE_CLIENT_ID`: danh sách OAuth client ID được phép, phân cách bằng dấu phẩy.
+- `CORS_ORIGINS`: các origin gọi API trực tiếp.
+- `NAS_CONTENT_ROOT`: nơi lưu nội dung chương, mặc định `./data/content`.
+- `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL`: cho gợi ý metadata EPUB.
+- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`,
+  `R2_PUBLIC_BASE_URL`: cho ảnh bìa.
 
-## Docker Compose
+Healthcheck: `GET /api/health`. FastAPI cung cấp `/docs` và `/openapi.json` khi
+service khởi động; chữ ký handler và Pydantic model trong `app/main.py` là nguồn
+chi tiết cho query/body. Một số response chưa khai báo schema đầy đủ trong OpenAPI.
 
-Current `docker-compose.yml` supports a unified deployment for both web + API.
+## Database và migration
 
-### Web + API (use external DBs)
+Repo có [Prisma schema](prisma/schema.prisma), [Prisma migrations](prisma/migrations)
+và [SQL migrations](migrations). Web hiện còn giữ một bản schema/migrations tương ứng.
+SQL migrations chứa cả lịch sử của pipeline import đã bỏ; không xem tất cả các
+bảng trong đó là tính năng đang được hỗ trợ.
+
+Database mới cần cả các bảng trong Prisma schema và `ChapterMeta` /
+`ChapterContentRef` của phần SQL. Hiện chưa có một lệnh bootstrap hoàn chỉnh,
+an toàn cho mọi trạng thái database. Khởi động API hoặc container PostgreSQL
+không tự tạo toàn bộ schema ứng dụng.
+
+Startup luôn chạy DDL bảo đảm bảng/index `NovelRating` tồn tại.
+`AUTO_SCHEMA_BOOTSTRAP` mặc định `false`. Nếu bật, startup còn chạy DDL lịch sử,
+bao gồm xóa bảng/cột cũ và nhân đôi rating trong khoảng nhất định; không bật
+thường trực hoặc dùng như lệnh migration lặp lại. Kiểm tra schema đang có và
+chọn migration cần thiết trước khi triển khai.
+
+## Docker và storage
+
+Checkout `reader-api` và `reader` cạnh nhau, cấu hình `.env`, sau đó:
 
 ```bash
 docker compose up -d --build api web
 ```
 
-Required env for web OAuth in `.env`:
+API mở cổng 8000, web mở cổng 3000. Web gọi API qua `http://api:8000`.
+`WEB_GOOGLE_CLIENT_ID` trong `.env` được compose truyền sang web; backend vẫn cần
+danh sách `GOOGLE_CLIENT_ID` của chính nó. Compose còn truyền các biến NextAuth
+và Google client secret cũ, nhưng luồng đăng nhập web hiện tại không dùng chúng.
 
-```env
-WEB_GOOGLE_CLIENT_ID=web-client-id.apps.googleusercontent.com
-WEB_GOOGLE_CLIENT_SECRET=replace-with-web-google-client-secret
-```
-
-### Full local stack (API local + Postgres)
+Để chạy API với PostgreSQL container local:
 
 ```bash
 docker compose --profile localdb up -d --build api-local postgres
 ```
 
-Notes:
-- `api` listens on port `8000` and is intended for external DB deployments.
-- `api-local` listens on port `8001` and automatically points to `postgres` container.
-- `web` listens on port `3000` and calls API internally through `http://api:8000`.
+API local mở cổng 8001, PostgreSQL mở cổng 5432. Vẫn cần chuẩn bị schema như trên.
+Service `web` trong compose trỏ vào `api`, không trỏ vào `api-local`; khi chạy web
+ngoài Docker với cấu hình này, đặt `READER_API_ORIGIN=http://localhost:8001`.
 
-### NAS mount points (chapter content + EPUB source)
+Volume `nas_chapter_content` được mount vào `/data/content`. Có thể thay bằng
+bind mount hoặc volume NFS phù hợp với hạ tầng. Compose cũng giữ mount
+`/data/epub-source`, nhưng import hiện tại nhận file multipart từ web, không có
+API quét thư viện SourceAsset. Không có script backfill chương được cung cấp
+trong repo hiện tại.
 
-API containers now reserve two mount folders:
+## Luồng import EPUB
 
-- `/data/content`: converted chapter files (`txt` + `raw_html`)
-- `/data/epub-source`: source EPUB library
+1. MOD/ADMIN chọn hoặc tạo thể loại qua `/api/mod/the-loai`.
+2. Upload file tới `POST /api/import/uploads/preview` để xem metadata/ảnh bìa.
+3. Có thể gọi `POST /api/mod/epub/ai-suggest` để nhận gợi ý metadata.
+4. Gọi `POST /api/mod/epub` để preview cách tách chương, rồi áp dụng import.
 
-Default env mapping (already wired in compose):
+Import ghi nội dung file, refs chương và metadata vào storage/database.
+Các tham số multipart cụ thể nằm trong handler và `/docs`.
 
-```env
-NAS_CONTENT_ROOT=/data/content
-EPUB_SOURCE_ROOT=/data/epub-source
-```
+## Tài liệu tích hợp
 
-If you want to bind to host folders for local testing:
+- [API contract hiện tại](CONTRACT.md)
+- [Đối chiếu web/mobile](CROSS_REPO_ENDPOINT_MATRIX.md)
+- [Web](../reader/README.md) và [mobile](../reader-app/README.md), khi checkout cạnh nhau
 
-```yaml
-services:
-  api:
-    volumes:
-      - /absolute/local/path/content:/data/content
-      - /absolute/local/path/epub-source:/data/epub-source
-```
-
-If you want to use NFS-backed docker volumes, define them under `volumes:`. Example:
-
-```yaml
-volumes:
-  nas_chapter_content:
-    driver: local
-    driver_opts:
-      type: nfs
-      o: addr=100.93.79.10,nolock,soft,rw
-      device: ":/volume2/apps/reader-content"
-
-  nas_epub_source:
-    driver: local
-    driver_opts:
-      type: nfs
-      o: addr=100.93.79.10,nolock,soft,rw
-      device: ":/volume2/apps/reader-epub"
-```
-
-For your EPUB structure (folder per novel, multiple `.epub` parts inside), mount the parent folder to `/data/epub-source`.
-
-## Implemented Endpoints (snapshot)
-
-**Public / user**
-
-- `GET /api/health`
-- `GET /api/genres`, `GET /api/genres/{slug}`
-- `GET /api/novels/browse`, `GET /api/novels/{idOrSlug}`
-- `GET /api/truyen` (query `slug`), `GET /api/truyen/{novel_id}/chapters`, `GET /api/truyen/{novel_id}/chapters/by-number/{n}`
-- `GET /api/chapters/{chapter_id}`
-- `GET /api/truyen/suggest`
-- `GET/POST /api/truyen/{novel_id}/comments`, `POST /api/truyen/{novel_id}/rate`
-
-**Auth**
-
-- `POST /api/auth/mobile-login` (JWT cho mobile)
-- `GET /api/auth/session` (session bridge cho web — xem handler trong `main.py`)
-
-**User (login)**
-
-- `GET /api/user/profile`
-- `GET/POST /api/user/bookmarks`, `DELETE /api/user/bookmarks/{novel_id}`
-- `POST /api/user/reading-progress`
-- `GET/POST /api/user/settings`
-- `GET/POST/DELETE /api/user/recommendations`
-
-**MOD / ADMIN** — prefix `/api/mod/*` (thể loại, truyện, chương, overview, đề cử, upload bìa, EPUB…). Liệt kê đầy đủ trong `app/main.py`.
-
-**Import (MOD — web)**
-
-- `POST /api/import/uploads/preview` — upload EPUB multipart để lấy preview metadata/cover gợi ý.
-- `POST /api/mod/epub`, `POST /api/mod/epub/ai-suggest` — luồng import EPUB chính.
-- `GET/POST/PUT/DELETE /api/mod/the-loai` — quản lý thể loại trong wizard.
-
-Luồng SourceAsset / `/api/import/assets/*` và job pipeline cũ đã **gỡ khỏi codebase** (không còn endpoint).
-
-## NAS Migration Ops
-
-### 1) Apply SQL migration manually
-
-Run SQL in `migrations/2026_04_nas_content_storage.sql` against PostgreSQL.
-
-### 2) Backfill existing chapter content to NAS + ChapterContentRef
-
-Dry-run first:
-
-```bash
-python scripts/backfill_chapter_content_refs.py --limit 1000 --dry-run
-```
-
-Then execute:
-
-```bash
-python scripts/backfill_chapter_content_refs.py --limit 1000
-```
-
-You can run multiple batches by increasing/changing `--limit`.
-
-Checkpoint/resume mode:
-
-```bash
-python scripts/backfill_chapter_content_refs.py --limit 1000 --state-file .backfill_state.json
-```
-
-## Chapter Read Cutover Flag
-
-Set in `.env`:
-
-```env
-CHAPTER_CONTENT_MODE=nas_first
-```
-
-Values:
-- `nas_first` (default): read NAS ref first.
-
-## Notes
-
-- Web session auth is supported via NextAuth session cookies (next-auth.session-token and secure variants).
-- Mobile auth is supported via Bearer JWT from /api/auth/mobile-login.
+Khi đổi nghiệp vụ hoặc contract, kiểm tra các client sử dụng trước khi release.
+Giữ tương thích với client đang triển khai; thay đổi phá vỡ tương thích cần có
+kế hoạch chuyển đổi rõ ràng.

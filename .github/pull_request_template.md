@@ -1,45 +1,17 @@
-## Summary
-- What problem does this PR solve?
-- Why now?
+## Thay đổi
 
-## Scope
-- [ ] Web (`reader`)
-- [ ] API (`reader-api`)
-- [ ] Mobile (`reader-app`)
+Mô tả vấn đề và hành vi sau thay đổi.
 
-## API Contract Impact
-- [ ] No API changes
-- [ ] Backward-compatible API changes
-- [ ] Breaking API changes (must include migration plan)
+## Ảnh hưởng tích hợp
 
-Changed endpoints:
-- `...`
+- Repo/client bị ảnh hưởng:
+- Endpoint hoặc dữ liệu thay đổi; cách giữ tương thích:
+- Auth nếu có thay đổi: web cookie `reader_access_token`, mobile Bearer JWT.
 
-## Auth Impact
-- [ ] None
-- [ ] Web session (NextAuth cookie)
-- [ ] Mobile JWT
+## Kiểm tra
 
-## Cross-Platform Parity Checklist
-- [ ] Web behavior aligned with API response
-- [ ] Mobile behavior aligned with API response
-- [ ] Error states consistent (401/403/4xx/5xx)
-- [ ] Pagination behavior consistent (`page`, `limit`)
+Ghi lệnh đã chạy, kết quả và luồng đã kiểm tra. Nêu rõ phần chưa kiểm tra.
 
-## Test Evidence
-- [ ] Unit tests
-- [ ] Integration/API tests
-- [ ] Manual smoke test Web
-- [ ] Manual smoke test Mobile
+## Triển khai
 
-Commands / notes:
-```bash
-# paste test/build commands executed
-```
-
-## Rollout & Rollback
-- Rollout order: API -> Web/Mobile -> QA
-- Rollback strategy:
-  - API:
-  - Web:
-  - Mobile:
+Nếu cần migration, thứ tự rollout hoặc rollback riêng, ghi tại đây.
