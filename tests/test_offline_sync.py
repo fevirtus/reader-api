@@ -23,10 +23,11 @@ os.environ["DATABASE_URL"] = URL
 _temp_content = tempfile.TemporaryDirectory(prefix="reader-sync-test-")
 os.environ["NAS_CONTENT_ROOT"] = _temp_content.name
 
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
 from app.database import SessionLocal, engine
-from app.main import _update_reading_progress, download_manifest
+from app.main import _update_reading_progress, app, download_manifest
 from app.offline_sync import SyncOperation, ensure_sync_schema, sync_operation
 
 
@@ -147,6 +148,67 @@ class OfflineSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["bookmark"]["lastChapterNumber"], 40)
         self.assertIn(10, result["bookmark"]["readChapters"])
 
+    async def test_web_bookmark_http_contract_and_offline_interop(self):
+        # Exact payloads sent by reader/lib/bookmark-context.tsx, without sync fields.
+        with patch("app.main.require_current_user", AsyncMock(return_value={"id": self.uid})):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    "/api/user/bookmarks",
+                    json={
+                        "action": "updateProgress",
+                        "novelId": "novel",
+                        "lastChapterId": "c40",
+                        "lastChapterNumber": 40,
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "updated")
+                self.assertEqual(response.json()["bookmark"]["lastChapterNumber"], 40)
+                await self.send(chapter=10)
+                response = await client.get("/api/user/bookmarks")
+                self.assertEqual(response.status_code, 200)
+                bookmarks = response.json()
+                self.assertIsInstance(bookmarks, list)
+                self.assertEqual(bookmarks[0]["lastChapterNumber"], 40)
+                self.assertEqual(set(bookmarks[0]["readChapters"]), {10, 40})
+                self.assertEqual(bookmarks[0]["novel"]["id"], "novel")
+                response = await client.post(
+                    "/api/user/bookmarks",
+                    json={
+                        "action": "markAsRead",
+                        "novelId": "novel",
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "marked")
+                self.assertTrue(response.json()["bookmark"]["markedAsRead"])
+                response = await client.get("/api/user/bookmarks?shelfStatus=completed")
+                self.assertEqual(len(response.json()), 1)
+                response = await client.delete("/api/user/bookmarks/novel")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), {"status": "removed"})
+                self.assertIsNone((await self.send(chapter=20))["bookmark"])
+                self.assertEqual((await client.get("/api/user/bookmarks")).json(), [])
+
+    async def test_existing_progress_endpoint_accepts_original_payload(self):
+        with patch("app.main.require_current_user", AsyncMock(return_value={"id": self.uid})):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    "/api/user/reading-progress",
+                    json={
+                        "novelId": "novel",
+                        "chapterId": "c2",
+                        "chapterNumber": 2,
+                    },
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["status"], "updated")
+                self.assertEqual(response.json()["bookmark"]["lastChapterId"], "c2")
+
     async def test_retry_after_commit_is_idempotent(self):
         event_id = "same-event"
         first = await self.send(chapter=30, seconds=30, event_id=event_id)
@@ -163,7 +225,7 @@ class OfflineSyncTests(unittest.IsolatedAsyncioTestCase):
             await db.execute(
                 text(
                     'UPDATE "ChapterContentRef" SET "contentHash"=\'changed\' '
-                    'WHERE "chapterId"=\'c1\''
+                    "WHERE \"chapterId\"='c1'"
                 )
             )
             edited = await download_manifest("novel", db)
