@@ -101,3 +101,62 @@ Xem [luồng import](README.md#luồng-import-epub) và handler để biết tha
 
 Không còn comments, user/editor recommendations, `/api/mod/truyen/missing`
 hoặc `/api/import/assets/*`. Không dùng những endpoint này cho tính năng mới.
+
+## Đồng bộ ngoại tuyến của mobile
+
+Triển khai API có các endpoint dưới đây trước khi phát hành app hỗ trợ sync.
+
+`POST /api/user/sync` yêu cầu Bearer token và nhận một thao tác:
+
+```json
+{
+  "eventId": "UUID-cua-thao-tac",
+  "kind": "progress",
+  "novelId": "novel-id",
+  "chapterId": "chapter-id",
+  "chapterNumber": 30,
+  "occurredAt": "2026-09-22T08:00:00Z",
+  "progress": 120.0
+}
+```
+
+- `kind`: `progress`, `markAsRead`, hoặc `remove`. Hai loại cuối không cần chương.
+- Backend lấy số chương chính thức theo ID và xác minh chương thuộc truyện.
+- Lịch sử chương đã đọc được hợp nhất dưới khóa transaction theo tài khoản/truyện.
+  Vị trí đọc và thao tác tủ sách chọn theo `occurredAt`; cùng thời điểm dùng
+  `eventId` để phân định. Không mặc định chọn chương lớn hơn vì có thể đang đọc lại.
+- Thời gian tương lai được chặn ở thời gian server. Chính sách này giả định đồng
+  hồ thiết bị tương đối đúng; timestamp không chứng minh thứ tự thực ngoài đời.
+- `remove` giữ tombstone để cập nhật offline cũ không khôi phục bookmark đã xóa.
+  Endpoint online cũ của web cũng ghi clock, nên tham gia cùng quy tắc.
+- Response chứa `acknowledgedEventId`, `status`, `bookmark` (nullable).
+  Client chỉ xóa thao tác khỏi outbox khi ID được xác nhận chính xác.
+- `chapter_deleted` / `novel_deleted` là kết quả cuối cùng được xác nhận;
+  client nhận lại bookmark còn hợp lệ. Lỗi transport/HTTP không được coi là ACK.
+- Offset cuộn chỉ lưu theo tài khoản trên thiết bị; không áp dụng pixel offset
+  giữa các thiết bị có font/kích thước màn hình khác nhau.
+
+Startup tạo bổ sung bảng `ReaderSyncClock` nếu chưa có, không bật
+`AUTO_SCHEMA_BOOTSTRAP` và không thay đổi bảng nội dung cũ.
+
+## Phiên bản bản tải
+
+`GET /api/novels/{novel_id}/download-manifest` trả `novelId`, `revision`,
+`chapters` gồm `id`, `number`, `title`, `contentHash` (SHA-256 nội dung UTF-8).
+Revision bao gồm metadata và checksum nên thay đổi khi thêm, sửa, xóa hoặc đổi
+thứ tự chương.
+
+App ưu tiên snapshot đã tải cho cả nội dung và mục lục. Chỉ nút **Cập nhật**
+mới thay snapshot: tải vào vùng tạm, kiểm tra checksum từng chương và kiểm tra
+lại revision, rồi commit nội dung/điều hướng/trạng thái cùng một transaction.
+Có thay đổi trong lúc tải hoặc mất mạng: giữ snapshot cũ và vùng tạm để thử lại.
+Không trộn cache đọc online vào snapshot. Bản tải cũ vẫn đọc được nếu chương
+bị gỡ trên server; cập nhật thành công sẽ loại chương không còn trong manifest.
+
+Kiểm thử API với PostgreSQL dùng riêng cho test:
+```bash
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:password@127.0.0.1:55439/reader_sync_test \
+  python -m unittest discover -s tests -v
+```
+Suite chỉ chấp nhận database local tên `reader_sync_test` và tạo lại bảng test;
+không chạy với database có dữ liệu cần giữ.

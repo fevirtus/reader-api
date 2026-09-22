@@ -31,8 +31,11 @@ Mobile chưa gọi hai endpoint này; settings lưu local, tìm kiếm qua brows
 Đây là hai khoảng trống so với mục tiêu tương đương tính năng người đọc.
 
 Mobile có TTS, cache Drift/SQLite và tải nội dung để đọc offline.
-Các khả năng này là phần riêng của app, không đồng nghĩa toàn bộ dữ liệu và
-thao tác offline đã có cơ chế đồng bộ lại lên server.
+Mobile đồng bộ tiến độ, đánh dấu đã đọc và xóa khỏi tủ sách qua
+`POST /api/user/sync`; snapshot tải xuống dùng
+`GET /api/novels/{novel_id}/download-manifest`.
+Đánh giá sao vẫn là thao tác online; settings vẫn lưu trên máy.
+Chi tiết conflict và thứ tự triển khai xem contract.
 
 ## Chỉ có trên web theo phạm vi sản phẩm
 

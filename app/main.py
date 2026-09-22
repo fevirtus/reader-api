@@ -34,6 +34,7 @@ from app.auth import ACCESS_TOKEN_TTL_SECONDS, create_access_token, require_curr
 from app.config import settings
 from app.database import get_db_session
 from app import deepseek
+from app.offline_sync import router as offline_router, ensure_sync_schema, lock_bookmark, record_online_operation
 from app.storage import storage
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ async def _ensure_novel_rating_table() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await _ensure_novel_rating_table()
+    await ensure_sync_schema()
     if str(settings.auto_schema_bootstrap).lower() in {"1", "true", "yes", "on"}:
         await _ensure_migration_tables()
     yield
@@ -141,6 +143,7 @@ async def _ensure_migration_tables() -> None:
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app.include_router(offline_router)
 
 
 
@@ -458,7 +461,19 @@ async def _update_reading_progress(
     novel_id: str,
     chapter_id: str,
     chapter_number: int,
+    *,
+    sync_managed: bool = False,
+    update_position: bool = True,
 ) -> dict[str, Any]:
+    await lock_bookmark(db, user_id, novel_id)
+    chapter = (await db.execute(text(
+        'SELECT number FROM "ChapterMeta" WHERE id=:id AND "novelId"=:nid'),
+        {"id": chapter_id, "nid": novel_id})).mappings().first()
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    chapter_number = chapter["number"]
+    if not sync_managed:
+        await record_online_operation(db, user_id, novel_id)
     row = (
         await db.execute(
             text(
@@ -483,7 +498,8 @@ async def _update_reading_progress(
         await db.execute(
             text(
                 'UPDATE "Bookmark" '
-                'SET "lastChapterId" = :chapter_id, "lastChapterNumber" = :chapter_number, '
+                'SET "lastChapterId" = CASE WHEN :update_position THEN :chapter_id ELSE "lastChapterId" END, '
+                '"lastChapterNumber" = CASE WHEN :update_position THEN :chapter_number ELSE "lastChapterNumber" END, '
                 '"readChapters" = :read_chapters, "hasCountedView" = :has_counted_view '
                 'WHERE id = :bookmark_id'
             ),
@@ -493,6 +509,7 @@ async def _update_reading_progress(
                 "read_chapters": read_chapters,
                 "has_counted_view": has_counted_view,
                 "bookmark_id": row["id"],
+                "update_position": update_position,
             },
         )
     else:
@@ -511,6 +528,12 @@ async def _update_reading_progress(
                 "read_chapters": read_chapters,
                 "has_counted_view": has_counted_view,
             },
+        )
+
+    if not row:
+        await db.execute(
+            text('UPDATE "Novel" SET "bookmarkCount" = "bookmarkCount" + 1 WHERE id = :id'),
+            {"id": novel_id},
         )
 
     if should_increment_view:
@@ -2022,6 +2045,20 @@ async def get_novel_detail(
     return payload
 
 
+@app.get("/api/novels/{novel_id}/download-manifest")
+async def download_manifest(novel_id: str, db: AsyncSession = Depends(get_db_session)):
+    exists = (await db.execute(text('SELECT id FROM "Novel" WHERE id=:id'), {"id": novel_id})).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail="Novel not found")
+    rows = (await db.execute(text(
+        'SELECT c.id, c.number, c.title, r."contentHash" '
+        'FROM "ChapterMeta" c LEFT JOIN "ChapterContentRef" r ON r."chapterId"=c.id '
+        'WHERE c."novelId"=:id ORDER BY c.number, c.id'), {"id": novel_id})).mappings().all()
+    chapters = [dict(row) for row in rows]
+    revision = hashlib.sha256(json.dumps(chapters, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    return {"novelId": novel_id, "revision": revision, "chapters": chapters}
+
+
 @app.get("/api/truyen/{novel_id}/chapters")
 async def get_novel_chapters(
     novel_id: str,
@@ -3429,6 +3466,7 @@ class BookmarkPayload(BaseModel):
 async def upsert_bookmark(payload: BookmarkPayload, request: Request, db: AsyncSession = Depends(get_db_session)):
     user = await require_current_user(request, db)
     action = (payload.action or "").strip()
+    await record_online_operation(db, user["id"], payload.novelId)
 
     existing = (
         await db.execute(
@@ -3520,6 +3558,7 @@ async def upsert_bookmark(payload: BookmarkPayload, request: Request, db: AsyncS
 @app.delete("/api/user/bookmarks/{novel_id}")
 async def delete_bookmark(novel_id: str, request: Request, db: AsyncSession = Depends(get_db_session)):
     user = await require_current_user(request, db)
+    await record_online_operation(db, user["id"], novel_id, deleted=True)
     row = (
         await db.execute(
             text(
