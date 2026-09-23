@@ -42,6 +42,10 @@ unreferenced worker-owned files are removed after seven days. No automated GC
 removes referenced historical snapshots. Monitor disk capacity and retention.
 Cleanup runs as a single background task: a slow NAS scan cannot stop queue
 consumption or heartbeats. A cleanup failure is logged and retried next hour.
+Chapter/preview source copies, WAV output and encoding use the worker's local
+temporary storage. Only completed AAC files are uploaded to a unique NAS staging
+file, flushed and checksum-verified, then atomically renamed before marking ready.
+This avoids repeated WAV header updates on NFS throughout a long render.
 
 `GET /api/audiobooks/assets/<id>` supports HEAD and HTTP Range. Public audio follows
 the same access policy as public chapter text. Request creation and listening

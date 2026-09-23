@@ -11,6 +11,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -190,8 +191,8 @@ async def render(job):
     destination = (
         parent / "audio" / digest(job["chapterId"]) / job["editionId"] / job["id"] / "chapter.m4a"
     )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="render-", dir=destination.parent) as tmp:
+    # WAV headers are repeatedly seeked/rewritten; keep intermediate I/O off NFS.
+    with tempfile.TemporaryDirectory(prefix="reader-render-") as tmp:
         tmp = Path(tmp)
         (tmp / "source.txt").write_text(source, encoding="utf-8")
         voice = next(v["modelVoice"] for v in VOICES if v["id"] == job["voiceId"])
@@ -260,7 +261,7 @@ async def render(job):
                 )
                 await db.commit()
                 return
-            os.replace(tmp / "chapter.m4a", destination)
+            await asyncio.to_thread(publish_audio, tmp / "chapter.m4a", destination, checksum)
             await db.execute(
                 text("""UPDATE "AudioBookAsset" SET status='ready',href=:href,sha256=:sha,
                 bytes=:bytes,duration=:duration,"updatedAt"=NOW(),error=NULL WHERE id=:id"""),
@@ -286,6 +287,29 @@ async def render(job):
 def file_hash(path):
     with open(path, "rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def publish_audio(source, destination, checksum):
+    """Copy only a finished encoded file to NAS, verify it, then atomically publish."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=".publish-", dir=destination.parent, delete=False
+    ) as out:
+        staged = Path(out.name)
+        try:
+            with open(source, "rb") as src:
+                shutil.copyfileobj(src, out)
+            out.flush()
+            os.fsync(out.fileno())
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
+    try:
+        if file_hash(staged) != checksum:
+            raise ValueError("Audio upload checksum mismatch")
+        os.replace(staged, destination)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def escape_metadata(value):
@@ -433,7 +457,7 @@ async def render_one_preview():
         if destination.is_file() or attempts >= 3 or time.monotonic() < retry_at:
             continue
         try:
-            with tempfile.TemporaryDirectory(prefix="sample-", dir=folder) as tmp:
+            with tempfile.TemporaryDirectory(prefix="reader-sample-") as tmp:
                 tmp = Path(tmp)
                 (tmp / "source.txt").write_text(PREVIEW_TEXT, encoding="utf-8")
                 await asyncio.wait_for(
@@ -460,7 +484,9 @@ async def render_one_preview():
                     str(tmp / "sample.m4a"),
                 )
                 duration = await probe(tmp / "sample.m4a")
-                os.replace(tmp / "sample.m4a", destination)
+                await asyncio.to_thread(
+                    publish_audio, tmp / "sample.m4a", destination, file_hash(tmp / "sample.m4a")
+                )
                 log.info("Voice preview ready: %s (%.1fs)", voice["id"], duration)
             _preview_failures.pop(voice["id"], None)
         except Exception:

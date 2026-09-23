@@ -269,6 +269,7 @@ class AudioBookTests(legacy.OfflineSyncTests):
         from app.audiobook_worker import run_process as real_process
 
         async def synth(source, output, voice):
+            self.assertFalse(Path(output).is_relative_to(storage.root))
             await real_process(
                 "ffmpeg",
                 "-v",
@@ -290,6 +291,21 @@ class AudioBookTests(legacy.OfflineSyncTests):
             self.assertIsNotNone(result["export"])
             self.assertFalse(result["export"]["hasUpdate"])
         self.assertFalse(await export_one())
+
+    async def test_failed_upload_does_not_replace_published_audio(self):
+        from app.audiobook_worker import publish_audio
+
+        target = storage.root / "chapter.m4a"
+        target.write_bytes(b"original audio")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "audio.m4a"
+            source.write_bytes(b"new audio")
+            with self.assertRaisesRegex(ValueError, "checksum"):
+                publish_audio(source, target, "wrong-checksum")
+            self.assertEqual(target.read_bytes(), b"original audio")
+            self.assertEqual(list(storage.root.glob(".publish-*")), [])
+            publish_audio(source, target, hashlib.sha256(b"new audio").hexdigest())
+            self.assertEqual(target.read_bytes(), b"new audio")
 
     async def test_audio_progress_does_not_rewind_or_change_legacy(self):
         book = await self.request_book()

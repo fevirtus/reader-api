@@ -82,7 +82,10 @@ class SynthRuntime:
                     await self.proc.stdin.drain()
                     result = json.loads(await self.proc.stdout.readline())
                     if result.get("ok") is not True:
-                        raise RuntimeError("Inference process failed")
+                        raise RuntimeError(
+                            "Inference process failed: "
+                            f"{result.get('errorType', 'unknown')} errno={result.get('errno')}"
+                        )
                     self.jobs += 1
                     self.last_used = time.monotonic()
                     log.info(

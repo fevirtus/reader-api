@@ -14,6 +14,9 @@ for line in sys.stdin:
     job=json.loads(line)
     if job['voice']=='crash': sys.exit(1)
     if job['voice']=='hang': time.sleep(30)
+    if job['voice']=='io-error':
+        print(json.dumps({'ok':False,'errorType':'OSError','errno':116}),flush=True)
+        time.sleep(30)
     print(json.dumps({'ok':True,'pid':os.getpid()}), flush=True)
 """
 
@@ -60,4 +63,9 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.runtime.last_used = 0
         await self.runtime.release_if_idle()
         self.assertIsNotNone(proc.returncode)
+        self.assertIsNone(self.runtime.proc)
+
+    async def test_child_error_type_survives_immediate_process_shutdown(self):
+        with self.assertRaisesRegex(RuntimeError, "OSError errno=116"):
+            await self.runtime.render("s", "d", "io-error")
         self.assertIsNone(self.runtime.proc)

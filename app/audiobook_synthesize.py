@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 import wave
 from pathlib import Path
 
@@ -130,10 +131,18 @@ def main():
             with contextlib.redirect_stdout(sys.stderr):
                 synthesize(model, request["source"], request["destination"], request["voice"])
             print(json.dumps({"ok": True, "renderSeconds": time.monotonic() - started}), flush=True)
-        except Exception:
-            # Do not send source text or library diagnostics into queue metadata.
-            print(json.dumps({"ok": False}), flush=True)
-            raise
+        except Exception as exc:
+            # Report diagnostics BEFORE notifying the parent, which then kills this child.
+            # Omit exception values, which can contain source text from third-party code.
+            traceback.print_tb(exc.__traceback__, file=sys.stderr)
+            error = {
+                "ok": False,
+                "errorType": type(exc).__name__,
+                "errno": getattr(exc, "errno", None),
+            }
+            print(json.dumps(error), file=sys.stderr, flush=True)
+            print(json.dumps(error), flush=True)
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":
