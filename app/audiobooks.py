@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import json
@@ -12,16 +13,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.audiobook_voices import (
+    MODEL_VERSION,
+    PREVIEW_REVISION,
+    PREVIEW_TEXT,
+    VOICES,
+    preview_directory,
+)
 from app.auth import require_current_user
 from app.database import engine, get_db_session
 from app.storage import storage
 
 router = APIRouter(prefix="/api/audiobooks", tags=["Audio book"])
-MODEL_VERSION = "vieneu-3.7.1-61b85e3-normalizer1-aac64"
-VOICES = [
-    {"id": "anh-khoi", "name": "Anh Khôi", "modelVoice": "Anh Khôi", "default": True},
-    {"id": "ngoc-linh", "name": "Ngọc Linh", "modelVoice": "Ngọc Linh", "default": False},
-]
 DDL = [
     """CREATE TABLE IF NOT EXISTS "AudioBookEdition" (
         id TEXT PRIMARY KEY, "novelId" TEXT NOT NULL REFERENCES "Novel"(id) ON DELETE CASCADE,
@@ -162,7 +165,39 @@ async def edition_manifest(db, eid):
 
 @router.get("/voices")
 async def voices():
-    return {"voices": [{k: v for k, v in voice.items() if k != "modelVoice"} for voice in VOICES]}
+    def ready_files():
+        folder = preview_directory(storage.root)
+        return {p.name for p in folder.glob("*.m4a") if p.is_file() and p.stat().st_size > 0}
+
+    ready = await asyncio.to_thread(ready_files)
+    return {
+        "previewText": PREVIEW_TEXT,
+        "voices": [
+            {
+                **{k: v for k, v in voice.items() if k != "modelVoice"},
+                "previewUrl": f"/api/audiobooks/voices/{voice['id']}/preview/{PREVIEW_REVISION}"
+                if voice["id"] + ".m4a" in ready
+                else None,
+            }
+            for voice in VOICES
+        ],
+    }
+
+
+@router.api_route("/voices/{voice_id}/preview/{revision}", methods=["GET", "HEAD"])
+async def voice_preview(voice_id: str, revision: str):
+    if revision != PREVIEW_REVISION or not any(v["id"] == voice_id for v in VOICES):
+        raise HTTPException(404, "Không tìm thấy giọng đọc")
+    path = preview_directory(storage.root) / (voice_id + ".m4a")
+    if not await asyncio.to_thread(path.is_file):
+        raise HTTPException(404, "Đoạn nghe thử đang được chuẩn bị")
+    return FileResponse(
+        path,
+        media_type="audio/mp4",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
 
 
 @router.get("/novels/{novel_id}")

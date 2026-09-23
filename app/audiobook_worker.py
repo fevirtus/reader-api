@@ -18,6 +18,7 @@ from pathlib import Path
 from sqlalchemy import text
 
 from app.audiobook_runtime import SynthRuntime
+from app.audiobook_voices import PREVIEW_TEXT, preview_directory
 from app.audiobooks import (
     MODEL_VERSION,
     VOICES,
@@ -346,6 +347,56 @@ async def cleanup_orphans():
     await asyncio.to_thread(clean)
 
 
+_preview_failures = {}
+
+
+async def render_one_preview():
+    """One shared sample per preset/revision; no inference in HTTP requests."""
+    folder = preview_directory(storage.root)
+    folder.mkdir(parents=True, exist_ok=True)
+    for voice in VOICES:
+        destination = folder / (voice["id"] + ".m4a")
+        attempts, retry_at = _preview_failures.get(voice["id"], (0, 0))
+        if destination.is_file() or attempts >= 3 or time.monotonic() < retry_at:
+            continue
+        try:
+            with tempfile.TemporaryDirectory(prefix="sample-", dir=folder) as tmp:
+                tmp = Path(tmp)
+                (tmp / "source.txt").write_text(PREVIEW_TEXT, encoding="utf-8")
+                await asyncio.wait_for(
+                    synth_runtime.render(tmp / "source.txt", tmp / "raw.wav", voice["modelVoice"]),
+                    120,
+                )
+                await run_process(
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(tmp / "raw.wav"),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "64k",
+                    "-ar",
+                    "24000",
+                    "-ac",
+                    "1",
+                    "-movflags",
+                    "+faststart",
+                    str(tmp / "sample.m4a"),
+                )
+                duration = await probe(tmp / "sample.m4a")
+                os.replace(tmp / "sample.m4a", destination)
+                log.info("Voice preview ready: %s (%.1fs)", voice["id"], duration)
+            _preview_failures.pop(voice["id"], None)
+        except Exception:
+            _preview_failures[voice["id"]] = (attempts + 1, time.monotonic() + 300)
+            log.exception("Voice preview failed: %s", voice["id"])
+        return True
+    return False
+
+
 async def main():
     await ensure_audio_schema()
     # Separate connection owns the global lock for the lifetime of this worker.
@@ -368,6 +419,7 @@ async def main():
                 if time.monotonic() - last_reconcile > 60:
                     await reconcile()
                     last_reconcile = time.monotonic()
+                preview_work = await render_one_preview()
                 job = await claim()
                 if job:
                     try:
@@ -385,11 +437,12 @@ async def main():
                             await db.commit()
                 else:
                     await synth_runtime.release_if_idle()
-                    await export_one()
+                    if not preview_work:
+                        await export_one()
                     if time.monotonic() - last_cleanup > 3600:
                         await cleanup_orphans()
                         last_cleanup = time.monotonic()
-                    await asyncio.sleep(15)
+                    await asyncio.sleep(0 if preview_work else 15)
             except Exception:
                 # Exit on loss of DB lock/connection; Kubernetes restarts and reacquires it.
                 log.exception("Worker interrupted")

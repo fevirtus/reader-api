@@ -50,6 +50,75 @@ class AudioBookTests(legacy.OfflineSyncTests):
         async with SessionLocal() as db:
             return await request_audio("novel", AudioRequest(voiceId=voice), None, db)
 
+    async def test_voice_catalog_and_cached_preview_range(self):
+        from app.audiobook_voices import PREVIEW_REVISION, preview_directory
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            catalog = (await client.get("/api/audiobooks/voices")).json()
+            self.assertEqual(len(catalog["voices"]), 23)
+            self.assertEqual(len({v["id"] for v in catalog["voices"]}), 23)
+            self.assertEqual([v["id"] for v in catalog["voices"] if v["default"]], ["anh-khoi"])
+            self.assertTrue(all(v["previewUrl"] is None for v in catalog["voices"]))
+            self.assertTrue(all("modelVoice" not in v for v in catalog["voices"]))
+            folder = preview_directory(storage.root)
+            folder.mkdir(parents=True)
+            (folder / "anh-khoi.m4a").write_bytes(b"0123456789")
+            catalog = (await client.get("/api/audiobooks/voices")).json()
+            url = catalog["voices"][0]["previewUrl"]
+            response = await client.get(url, headers={"Range": "bytes=2-5"})
+            self.assertEqual(response.status_code, 206)
+            self.assertEqual(response.content, b"2345")
+            self.assertIn("immutable", response.headers["cache-control"])
+            self.assertEqual((await client.head(url)).status_code, 200)
+            self.assertEqual(
+                (await client.get(url.replace(PREVIEW_REVISION, "old"))).status_code, 404
+            )
+            self.assertEqual(
+                (await client.get(url.replace("anh-khoi", "unknown"))).status_code, 404
+            )
+        async with SessionLocal() as db:
+            self.assertEqual(
+                (await db.execute(text('SELECT COUNT(*) FROM "AudioBookAsset"'))).scalar_one(), 0
+            )
+
+    async def test_voice_preview_generated_once_and_failure_skips_to_next(self):
+        import app.audiobook_worker as worker
+        from app.audiobook_voices import preview_directory
+
+        worker._preview_failures.clear()
+        calls = []
+
+        async def synth(source, output, voice):
+            calls.append(voice)
+            await worker.run_process(
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.3",
+                str(output),
+            )
+
+        with patch.object(worker.synth_runtime, "render", synth):
+            self.assertTrue(await worker.render_one_preview())
+            first = preview_directory(storage.root) / "anh-khoi.m4a"
+            stamp = first.stat().st_mtime_ns
+            self.assertTrue(await worker.render_one_preview())
+            self.assertEqual(first.stat().st_mtime_ns, stamp)
+            self.assertEqual(calls, ["Anh Khôi", "Minh Đức"])
+        with patch.object(
+            worker.synth_runtime, "render", AsyncMock(side_effect=RuntimeError("test"))
+        ):
+            with self.assertLogs("audiobook-worker", level="ERROR"):
+                await worker.render_one_preview()
+        with patch.object(worker.synth_runtime, "render", synth):
+            await worker.render_one_preview()
+            self.assertEqual(calls[-1], "Thái Sơn")
+        worker._preview_failures.clear()
+
     async def test_audio_duplicate_requests_and_parallel_voices(self):
         first = await self.request_book()
         second = await self.request_book()

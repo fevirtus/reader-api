@@ -165,7 +165,12 @@ không chạy với database có dữ liệu cần giữ.
 
 V1 device TTS and all existing text/offline endpoints retain their payloads.
 
-- `GET /api/audiobooks/voices`: enabled voice IDs, names and default selection.
+- `GET /api/audiobooks/voices`: all 23 presets of the pinned model, stable IDs,
+  names, default selection, `gender`, `region`, and nullable `previewUrl`.
+  Root `previewText` is the shared sample text. Null URL means still preparing.
+- `GET|HEAD /api/audiobooks/voices/{voiceId}/preview/{revision}`: shared immutable
+  M4A sample with HTTP Range support. Public, read-only; listening creates no jobs
+  or listening-progress events. Worker pre-generates samples once per version.
 - `GET /api/audiobooks/novels/{novelId}`: parallel voice editions with manifests.
 - `POST /api/audiobooks/novels/{novelId}/requests` with `{voiceId}`: authenticated,
   idempotent request (202); up to five new edition requests per user per day.

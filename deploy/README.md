@@ -61,3 +61,10 @@ passage, three generations per setting): model startup ~6 seconds, two threads
 so these are indicative samples, not a whole-chapter SLA. Keep one thread until
 representative longer benchmarks justify increasing it. Warm reuse removes model
 startup between jobs; it does not imply real-time rendering on this CPU.
+
+Voice previews: the worker generates one short shared sample for each of the 23
+pinned presets in `audiobook-previews/<revision>/<voiceId>.m4a` on the content PVC.
+A sample and a story chapter get a turn in each loop, avoiding chapter starvation.
+Samples publish atomically after encoding/validation; preview errors back off and
+do not stop chapter rendering. No public HTTP request performs inference. Wait
+for all 23 `previewUrl` values to become non-null before declaring rollout complete.
