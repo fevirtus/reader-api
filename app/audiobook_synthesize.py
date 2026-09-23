@@ -3,6 +3,7 @@
 import contextlib
 import html
 import json
+import logging
 import os
 import re
 import shutil
@@ -83,6 +84,11 @@ def synthesize(model, source, destination, voice):
     if not content:
         raise ValueError("Empty chapter")
     samples = 0
+    chunks = 0
+    started = last_report = time.monotonic()
+    logging.getLogger("audiobook-synthesize").info(
+        "Synthesis started voice=%s chars=%s", voice, len(content)
+    )
     with wave.open(destination, "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
@@ -94,6 +100,16 @@ def synthesize(model, source, destination, voice):
             pcm = (np.clip(values, -1, 1) * 32767).astype("<i2")
             output.writeframes(pcm.tobytes())
             samples += pcm.size
+            chunks += 1
+            now = time.monotonic()
+            if chunks == 1 or now - last_report >= 30:
+                logging.getLogger("audiobook-synthesize").info(
+                    "Synthesis progress chunks=%s audioSeconds=%.1f elapsedSeconds=%.1f",
+                    chunks,
+                    samples / 48000,
+                    now - started,
+                )
+                last_report = now
     if samples == 0:
         raise ValueError("Empty audio")
 
@@ -121,4 +137,5 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     main()

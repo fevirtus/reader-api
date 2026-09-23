@@ -1,5 +1,6 @@
 """Audio book integration tests on the same explicitly disposable database as sync tests."""
 
+import asyncio
 import hashlib
 import tempfile
 from pathlib import Path
@@ -49,6 +50,65 @@ class AudioBookTests(legacy.OfflineSyncTests):
     async def request_book(self, voice="anh-khoi"):
         async with SessionLocal() as db:
             return await request_audio("novel", AudioRequest(voiceId=voice), None, db)
+
+    async def test_slow_cleanup_does_not_block_claiming_a_chapter(self):
+        from app.audiobook_worker import background_tasks, consume_queue
+
+        await self.request_book()
+        cleanup_started = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+        claimed = []
+
+        async def stuck_cleanup():
+            cleanup_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleanup_cancelled.set()
+
+        async def rendered(job):
+            await cleanup_started.wait()
+            self.assertFalse(cleanup_cancelled.is_set())
+            claimed.append(job)
+            raise asyncio.CancelledError()  # End the infinite consumer after the first claim.
+
+        with (
+            patch("app.audiobook_worker.cleanup_orphans", side_effect=stuck_cleanup),
+            patch("app.audiobook_worker.render_one_preview", AsyncMock(return_value=False)),
+            patch("app.audiobook_worker.render", side_effect=rendered),
+        ):
+            async with background_tasks():
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(consume_queue(AsyncMock()), timeout=3)
+        self.assertEqual(len(claimed), 1)
+        self.assertTrue(cleanup_cancelled.is_set())
+
+    async def test_operator_status_reports_queue_backoff_and_active_chapter(self):
+        from app.audiobook_status import queue_status
+
+        await self.request_book()
+        job = await claim()
+        result = await queue_status()
+        self.assertEqual(result["counts"], {"queued": 49, "rendering": 1})
+        self.assertEqual(result["eligible"], 49)
+        self.assertEqual(result["rendering"][0]["assetId"], job["id"])
+        self.assertEqual(result["rendering"][0]["chapter"], 1)
+        async with SessionLocal() as db:
+            await db.execute(
+                text("""UPDATE "AudioBookAsset" SET status='failed',
+                "retryAt"=NOW()+INTERVAL '5 minutes' WHERE id=:id"""),
+                {"id": job["id"]},
+            )
+            await db.commit()
+        self.assertEqual((await queue_status())["backoff"], 1)
+        async with SessionLocal() as db:
+            await db.execute(
+                text('UPDATE "AudioBookAsset" SET attempts=3 WHERE id=:id'), {"id": job["id"]}
+            )
+            await db.commit()
+        result = await queue_status()
+        self.assertEqual(result["backoff"], 0)
+        self.assertEqual(result["exhausted"], 1)
 
     async def test_voice_catalog_and_cached_preview_range(self):
         from app.audiobook_voices import PREVIEW_REVISION, preview_directory

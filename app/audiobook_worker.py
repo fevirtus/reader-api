@@ -13,11 +13,13 @@ import os
 import re
 import tempfile
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from sqlalchemy import text
 
 from app.audiobook_runtime import SynthRuntime
+from app.audiobook_status import queue_status
 from app.audiobook_voices import PREVIEW_TEXT, preview_directory
 from app.audiobooks import (
     MODEL_VERSION,
@@ -32,6 +34,65 @@ from app.storage import storage
 
 log = logging.getLogger("audiobook-worker")
 synth_runtime = SynthRuntime()
+_activity = {"phase": "starting", "assetId": None, "since": time.monotonic()}
+_maintenance_started = None
+
+
+def phase(name, asset_id=None):
+    _activity.update(phase=name, assetId=asset_id, since=time.monotonic())
+    log.info("Worker phase=%s asset=%s", name, asset_id or "-")
+
+
+async def heartbeat():
+    while True:
+        try:
+            status = await queue_status()
+            log.info(
+                "Queue heartbeat phase=%s asset=%s elapsed=%.0fs counts=%s "
+                "eligible=%s backoff=%s exhausted=%s cleanupElapsed=%s",
+                _activity["phase"],
+                _activity["assetId"] or "-",
+                time.monotonic() - _activity["since"],
+                status["counts"],
+                status["eligible"],
+                status["backoff"],
+                status["exhausted"],
+                round(time.monotonic() - _maintenance_started)
+                if _maintenance_started is not None
+                else "idle",
+            )
+        except Exception:
+            log.exception("Queue heartbeat failed")
+        await asyncio.sleep(30)
+
+
+async def maintenance_loop():
+    global _maintenance_started
+    while True:
+        _maintenance_started = time.monotonic()
+        log.info("Audio cleanup started in background")
+        try:
+            await cleanup_orphans()
+            log.info(
+                "Audio cleanup finished elapsed=%.1fs", time.monotonic() - _maintenance_started
+            )
+        except Exception:
+            log.exception("Audio cleanup failed; render queue continues")
+        finally:
+            _maintenance_started = None
+        await asyncio.sleep(3600)
+
+
+@asynccontextmanager
+async def background_tasks():
+    # Exactly one cleanup scan at a time, never awaited by the queue consumer.
+    tasks = [asyncio.create_task(maintenance_loop()), asyncio.create_task(heartbeat())]
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def run_process(*args, timeout=3600):
@@ -120,6 +181,7 @@ async def claim():
 
 
 async def render(job):
+    phase("reading-source", job["id"])
     source = await asyncio.to_thread(storage.read_text, job["txtHref"])
     if hashlib.sha256(source.encode()).hexdigest() != job["sourceHash"]:
         raise ValueError("Chapter changed before rendering")
@@ -135,7 +197,9 @@ async def render(job):
         voice = next(v["modelVoice"] for v in VOICES if v["id"] == job["voiceId"])
         # Reuse a warm model; a timeout/crash kills only the inference process.
         started = time.monotonic()
+        phase("synthesizing", job["id"])
         await synth_runtime.render(tmp / "source.txt", tmp / "raw.wav", voice)
+        phase("encoding", job["id"])
         await run_process(
             "ffmpeg",
             "-v",
@@ -166,6 +230,7 @@ async def render(job):
         )
         checksum = await asyncio.to_thread(file_hash, tmp / "chapter.m4a")
         size = (tmp / "chapter.m4a").stat().st_size
+        phase("publishing", job["id"])
         # Lock the chapter while publishing; deleted or changed sources must not publish.
         async with SessionLocal() as db:
             current = (
@@ -208,6 +273,14 @@ async def render(job):
                 },
             )
             await db.commit()
+        log.info(
+            "Render ready asset=%s chapter=%s voice=%s bytes=%s audioSeconds=%.1f",
+            job["id"],
+            job["number"],
+            job["voiceId"],
+            size,
+            duration,
+        )
 
 
 def file_hash(path):
@@ -410,44 +483,56 @@ async def main():
                     WHERE status='rendering' """)
             )
             await db.commit()
-        last_reconcile = 0
-        last_cleanup = 0
-        while True:
-            try:
-                # Detect lost ownership before starting another job.
-                await lock.execute(text("SELECT 1"))
-                if time.monotonic() - last_reconcile > 60:
-                    await reconcile()
-                    last_reconcile = time.monotonic()
-                preview_work = await render_one_preview()
-                job = await claim()
-                if job:
-                    try:
-                        await render(job)
-                    except Exception:
-                        log.exception("Render failed: %s", job["id"])
-                        async with SessionLocal() as db:
-                            await db.execute(
-                                text("""UPDATE "AudioBookAsset" SET status='failed',
+        async with background_tasks():
+            await consume_queue(lock)
+
+
+async def consume_queue(lock):
+    last_reconcile = 0
+    while True:
+        try:
+            # Detect lost ownership before starting another job.
+            await lock.execute(text("SELECT 1"))
+            if time.monotonic() - last_reconcile > 60:
+                phase("reconciling")
+                await reconcile()
+                last_reconcile = time.monotonic()
+            preview_work = await render_one_preview()
+            job = await claim()
+            if job:
+                log.info(
+                    "Render claimed asset=%s novel=%s chapter=%s voice=%s attempt=%s",
+                    job["id"],
+                    job["novelId"],
+                    job["number"],
+                    job["voiceId"],
+                    job["attempts"] + 1,
+                )
+                try:
+                    await render(job)
+                except Exception:
+                    log.exception("Render failed: %s", job["id"])
+                    async with SessionLocal() as db:
+                        await db.execute(
+                            text("""UPDATE "AudioBookAsset" SET status='failed',
                                 error='Không thể tạo audio. Hệ thống sẽ thử lại tối đa 3 lần.',
                                 "retryAt"=NOW()+INTERVAL '5 minutes',"updatedAt"=NOW()
                                 WHERE id=:id AND status='rendering' AND attempts=:attempt"""),
-                                {"id": job["id"], "attempt": job["attempts"] + 1},
-                            )
-                            await db.commit()
-                else:
-                    await synth_runtime.release_if_idle()
-                    if not preview_work:
-                        await export_one()
-                    # A large NAS scan must not delay bootstrapping the voice catalogue.
-                    if not preview_work and time.monotonic() - last_cleanup > 3600:
-                        await cleanup_orphans()
-                        last_cleanup = time.monotonic()
-                    await asyncio.sleep(0 if preview_work else 15)
-            except Exception:
-                # Exit on loss of DB lock/connection; Kubernetes restarts and reacquires it.
-                log.exception("Worker interrupted")
-                raise
+                            {"id": job["id"], "attempt": job["attempts"] + 1},
+                        )
+                        await db.commit()
+            else:
+                phase("idle")
+                await synth_runtime.release_if_idle()
+                if not preview_work:
+                    phase("checking-exports")
+                    await export_one()
+                phase("idle")
+                await asyncio.sleep(0 if preview_work else 15)
+        except Exception:
+            # Exit on loss of DB lock/connection; Kubernetes restarts and reacquires it.
+            log.exception("Worker interrupted")
+            raise
 
 
 if __name__ == "__main__":

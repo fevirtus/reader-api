@@ -6,6 +6,7 @@ import asyncio
 import datetime as dt
 import hashlib
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -25,6 +26,7 @@ from app.database import engine, get_db_session
 from app.storage import storage
 
 router = APIRouter(prefix="/api/audiobooks", tags=["Audio book"])
+log = logging.getLogger("uvicorn.error.audiobook")
 DDL = [
     """CREATE TABLE IF NOT EXISTS "AudioBookEdition" (
         id TEXT PRIMARY KEY, "novelId" TEXT NOT NULL REFERENCES "Novel"(id) ON DELETE CASCADE,
@@ -75,7 +77,7 @@ def digest(value) -> str:
 
 async def queue_edition(db, edition):
     """Idempotent reconciliation; metadata hashes only, never reads chapter files in API."""
-    await db.execute(
+    result = await db.execute(
         text("""INSERT INTO "AudioBookAsset"
         (id,"editionId","chapterId","sourceHash","modelVersion")
         SELECT md5(:eid || ':' || c.id || ':' || r."contentHash" || ':' || :model),
@@ -85,6 +87,7 @@ async def queue_edition(db, edition):
         ON CONFLICT DO NOTHING"""),
         {"eid": edition["id"], "nid": edition["novelId"], "model": MODEL_VERSION},
     )
+    return result.rowcount
 
 
 async def edition_manifest(db, eid):
@@ -280,8 +283,15 @@ async def request_audio(
         ON CONFLICT DO NOTHING"""),
         {"uid": user["id"], "eid": eid},
     )
-    await queue_edition(db, {"id": eid, "novelId": novel_id})
+    added = await queue_edition(db, {"id": eid, "novelId": novel_id})
     await db.commit()
+    log.info(
+        "Audio request accepted novel=%s edition=%s voice=%s chaptersAdded=%s",
+        novel_id,
+        eid,
+        payload.voiceId,
+        added,
+    )
     return await edition_manifest(db, eid)
 
 
