@@ -87,7 +87,11 @@ async def maintenance_loop():
 @asynccontextmanager
 async def background_tasks():
     # Exactly one cleanup scan at a time, never awaited by the queue consumer.
-    tasks = [asyncio.create_task(maintenance_loop()), asyncio.create_task(heartbeat())]
+    tasks = [
+        asyncio.create_task(maintenance_loop()),
+        asyncio.create_task(heartbeat()),
+        asyncio.create_task(requested_cleanup_loop()),
+    ]
     try:
         yield
     finally:
@@ -415,6 +419,54 @@ async def export_one():
             await db.commit()
             return True
     return False
+
+
+async def requested_cleanup_loop():
+    while True:
+        try:
+            await cleanup_requested()
+        except Exception:
+            log.exception("Requested cleanup failed; will retry")
+        await asyncio.sleep(30)
+
+
+async def cleanup_requested():
+    """Durable, bounded deletion of retired audio; never touches chapter text."""
+    async with SessionLocal() as db:
+        rows = (
+            (
+                await db.execute(
+                    text('SELECT href FROM "AudioBookGarbage" ORDER BY "createdAt" LIMIT 100')
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for href in rows:
+            # Guard against accidental source-content deletion even if metadata is corrupt.
+            if (
+                not href.startswith("novel-")
+                or "/audio/" not in href
+                or not href.endswith("/chapter.m4a")
+            ):
+                log.error("Refusing unexpected audio cleanup path")
+                continue
+            referenced = (
+                await db.execute(
+                    text("""SELECT 1 FROM "AudioBookAsset" WHERE href=:href
+                UNION ALL SELECT 1 FROM "AudioBookExport" WHERE href=:href LIMIT 1"""),
+                    {"href": href},
+                )
+            ).first()
+            if referenced:
+                continue
+            await asyncio.to_thread(storage.delete_href, href)
+            await db.execute(
+                text('DELETE FROM "AudioBookGarbage" WHERE href=:href'), {"href": href}
+            )
+            await db.commit()
+        if rows:
+            log.info("Requested audio cleanup processed files=%s", len(rows))
 
 
 async def cleanup_orphans():

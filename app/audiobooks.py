@@ -28,6 +28,8 @@ from app.storage import storage
 router = APIRouter(prefix="/api/audiobooks", tags=["Audio book"])
 log = logging.getLogger("uvicorn.error.audiobook")
 DDL = [
+    """CREATE TABLE IF NOT EXISTS "AudioBookGarbage" (href TEXT PRIMARY KEY,
+        bytes BIGINT NOT NULL, "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW())""",
     """CREATE TABLE IF NOT EXISTS "AudioBookEdition" (
         id TEXT PRIMARY KEY, "novelId" TEXT NOT NULL REFERENCES "Novel"(id) ON DELETE CASCADE,
         "voiceId" TEXT NOT NULL, "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -94,7 +96,7 @@ async def edition_manifest(db, eid):
     edition = (
         (
             await db.execute(
-                text("""SELECT e.*, n.title FROM "AudioBookEdition" e
+                text("""SELECT e.*, n.title, n.slug, n."coverUrl" FROM "AudioBookEdition" e
         JOIN "Novel" n ON n.id=e."novelId" WHERE e.id=:id"""),
                 {"id": eid},
             )
@@ -150,6 +152,8 @@ async def edition_manifest(db, eid):
         "id": eid,
         "novelId": edition["novelId"],
         "title": edition["title"],
+        "slug": edition["slug"],
+        "coverUrl": edition["coverUrl"],
         "voiceId": edition["voiceId"],
         "revision": revision,
         "chapters": chapters,
@@ -375,7 +379,7 @@ async def save_progress(
         await db.execute(
             text("""SELECT a.duration FROM "AudioBookAsset" a
         JOIN "AudioBookEdition" e ON e.id=a."editionId"
-        WHERE a.id=:aid AND e.id=:eid AND e."novelId"=:nid AND a.status='ready' """),
+        WHERE a.id=:aid AND e.id=:eid AND e."novelId"=:nid AND a.status='ready' FOR SHARE OF a """),
             {"aid": payload.assetId, "eid": payload.editionId, "nid": novel_id},
         )
     ).first()

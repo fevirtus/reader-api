@@ -22,6 +22,7 @@ class AudioBookTests(legacy.OfflineSyncTests):
         await engine.dispose()
         async with engine.begin() as c:
             for name in [
+                "AudioBookGarbage",
                 "AudioBookProgress",
                 "AudioBookRequest",
                 "AudioBookExport",
@@ -50,6 +51,103 @@ class AudioBookTests(legacy.OfflineSyncTests):
     async def request_book(self, voice="anh-khoi"):
         async with SessionLocal() as db:
             return await request_audio("novel", AudioRequest(voiceId=voice), None, db)
+
+    async def test_admin_permissions_and_queue(self):
+
+        from app.audiobook_admin import overview, render_more
+
+        book = await self.request_book()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            with patch("app.auth.resolve_current_user", AsyncMock(return_value=None)):
+                self.assertEqual((await client.get("/api/audiobooks/admin")).status_code, 401)
+            with patch(
+                "app.auth.resolve_current_user",
+                AsyncMock(return_value={"id": "user", "role": "USER"}),
+            ):
+                for path in ["render", "cleanup"]:
+                    self.assertEqual(
+                        (
+                            await client.post(f"/api/audiobooks/admin/editions/{book['id']}/{path}")
+                        ).status_code,
+                        403,
+                    )
+        with patch("app.audiobook_admin.require_mod_user", AsyncMock(return_value={"id": "user"})):
+            async with SessionLocal() as db:
+                job = await claim()
+                result = await overview(None, "", 1, db)
+                self.assertEqual(result["items"][0]["total"], 50)
+                self.assertEqual(result["items"][0]["rendering"], 1)
+                self.assertEqual(result["items"][0]["active"][0]["number"], 1)
+                queued = await render_more(book["id"], None, db)
+                self.assertEqual(queued, {"added": 0, "retried": 0})
+                status = (
+                    await db.execute(
+                        text('SELECT status FROM "AudioBookAsset" WHERE id=:id'), {"id": job["id"]}
+                    )
+                ).scalar_one()
+                self.assertEqual(status, "rendering")
+
+    async def test_admin_cleanup_keeps_progress_and_deletes_only_old_audio(self):
+        from app.audiobook_admin import cleanup
+        from app.audiobook_worker import cleanup_requested
+
+        book = await self.request_book()
+        old = book["chapters"][0]["requestedAssetId"]
+        href = "novel-n/audio/voice/chapter/old/chapter.m4a"
+        path = storage.root / href
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"old-audio")
+        source = storage.root / "chapter.txt"
+        source.write_text("keep source")
+        async with SessionLocal() as db:
+            await db.execute(
+                text("""UPDATE "AudioBookAsset" SET status='ready',href=:href,bytes=9,
+              "updatedAt"=NOW()-INTERVAL '8 days' WHERE id=:id"""),
+                {"href": href, "id": old},
+            )
+            await db.execute(
+                text(
+                    """UPDATE "ChapterContentRef" SET "contentHash"='new' WHERE "chapterId"='c1' """
+                )
+            )
+            await db.commit()
+        updated = await self.request_book()
+        latest = updated["chapters"][0]["requestedAssetId"]
+        async with SessionLocal() as db:
+            await db.execute(
+                text("""UPDATE "AudioBookAsset" SET status='ready' WHERE id=:id"""), {"id": latest}
+            )
+            await db.execute(
+                text(
+                    """INSERT INTO "AudioBookProgress"
+                    VALUES ('user','novel',:eid,:aid,1,'event',NOW())"""
+                ),
+                {"eid": book["id"], "aid": old},
+            )
+            await db.commit()
+        with patch("app.audiobook_admin.require_mod_user", AsyncMock(return_value={"id": "user"})):
+            async with SessionLocal() as db:
+                self.assertEqual((await cleanup(book["id"], None, db))["files"], 0)
+                await db.execute(text('DELETE FROM "AudioBookProgress"'))
+                await db.commit()
+                result = await cleanup(book["id"], None, db)
+                self.assertEqual(result["files"], 1)
+                self.assertTrue(path.exists())  # HTTP request never waits for NAS deletion.
+        await cleanup_requested()
+        self.assertFalse(path.exists())
+        self.assertEqual(source.read_text(), "keep source")
+        async with SessionLocal() as db:
+            self.assertEqual(
+                (await db.execute(text('SELECT COUNT(*) FROM "AudioBookGarbage"'))).scalar_one(), 0
+            )
+            self.assertEqual(
+                (
+                    await db.execute(
+                        text('SELECT status FROM "AudioBookAsset" WHERE id=:id'), {"id": latest}
+                    )
+                ).scalar_one(),
+                "ready",
+            )
 
     async def test_slow_cleanup_does_not_block_claiming_a_chapter(self):
         from app.audiobook_worker import background_tasks, consume_queue

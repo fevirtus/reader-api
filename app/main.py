@@ -37,6 +37,7 @@ from app import deepseek
 from app.offline_sync import router as offline_router, ensure_sync_schema, lock_bookmark, record_online_operation
 from app.storage import storage
 from app.audiobooks import router as audiobook_router, ensure_audio_schema
+from app.audiobook_admin import router as audiobook_admin_router
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,7 @@ async def _ensure_migration_tables() -> None:
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(offline_router)
 app.include_router(audiobook_router)
+app.include_router(audiobook_admin_router)
 
 
 

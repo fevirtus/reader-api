@@ -194,3 +194,24 @@ on upgrade; text downloads and V1 device TTS remain unchanged. Network failures
 retain playback position and can retry while playback is still requested.
 Whole-book M4B exports remain server-side for future extraction, not as an offline
 library feature. Existing manifest and asset HTTP shapes remain compatible.
+
+### Audio book management and listening surfaces
+
+- Web supports text reading and streamed Audio book only; browser speech synthesis is removed.
+  Device TTS V1 remains available on Android.
+- Edition manifests add `slug` and `coverUrl` for listening/reading chapter handoff.
+  Text paragraph position and audio seconds remain independent; opening the same chapter
+  does not approximate or overwrite paragraph progress.
+- `GET /api/audiobooks/admin?q=&page=1` requires MOD/ADMIN. Returns 20 voice editions
+  per page, chapter readiness/current-version counts, queue/errors/active render elapsed
+  time, managed chapter/export bytes, and durable pending-cleanup bytes.
+  These sizes are managed files, not filesystem free/used capacity.
+- `POST /api/audiobooks/admin/editions/{id}/render` requires MOD/ADMIN. Enqueues
+  missing current versions and resets failed current jobs for retry; ready and rendering
+  jobs remain untouched. Normal users retain the existing request endpoint and quota.
+- `POST /api/audiobooks/admin/editions/{id}/cleanup` requires MOD/ADMIN. Retires only
+  ready chapter versions older than 7 days with a current ready replacement and no
+  saved listening progress reference. It atomically writes a durable deletion queue;
+  the worker processes up to 100 files every 30 seconds independently of synthesis
+  and slow NAS scans. Pending bytes remain visible until deletion succeeds.
+  Current chapter audio, active rendering, text content, and whole-book exports remain.
