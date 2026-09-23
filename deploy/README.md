@@ -35,6 +35,9 @@ Increasing replica count alone does not increase throughput. Model weights are c
 PVC and copied out of Hugging Face blob symlinks for ONNX external-data validation.
 Inference is retried up to three times with five-minute backoff. Failed jobs stay
 visible; operators can reset attempts after fixing the underlying problem.
+Eligible work is ordered by chapter number then edition creation time. After its
+backoff, an early failed chapter retries before later chapters instead of waiting
+for every fresh chapter in a large book. Attempt counters are retained.
 
 The worker reconciles requested editions with chapter hashes every minute. Old
 ready versions stay downloadable. Chapter/novel deletion cascades job metadata;

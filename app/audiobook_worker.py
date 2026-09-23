@@ -163,7 +163,7 @@ async def claim():
             JOIN "ChapterContentRef" r ON r."chapterId"=c.id
             WHERE a.status IN ('queued','failed') AND a.attempts<3 AND a."retryAt"<=NOW()
             AND a."sourceHash"=r."contentHash" AND a."modelVersion"=:model
-            ORDER BY a.attempts, c.number, e."createdAt" LIMIT 1 FOR UPDATE OF a SKIP LOCKED"""),
+            ORDER BY c.number, e."createdAt", a.attempts LIMIT 1 FOR UPDATE OF a SKIP LOCKED"""),
                     {"model": MODEL_VERSION},
                 )
             )

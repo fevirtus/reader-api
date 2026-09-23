@@ -250,6 +250,27 @@ class AudioBookTests(legacy.OfflineSyncTests):
                 ).first()
             )
 
+    async def test_retry_after_backoff_does_not_wait_behind_the_entire_book(self):
+        await self.request_book()
+        first = await claim()
+        async with SessionLocal() as db:
+            await db.execute(
+                text("""UPDATE "AudioBookAsset" SET status='failed',
+                "retryAt"=NOW()+INTERVAL '5 minutes' WHERE id=:id"""),
+                {"id": first["id"]},
+            )
+            await db.commit()
+        self.assertEqual((await claim())["number"], 2)
+        async with SessionLocal() as db:
+            await db.execute(
+                text('UPDATE "AudioBookAsset" SET "retryAt"=NOW() WHERE id=:id'),
+                {"id": first["id"]},
+            )
+            await db.commit()
+        retry = await claim()
+        self.assertEqual(retry["id"], first["id"])
+        self.assertEqual(retry["attempts"], 1)  # The real attempt counter is preserved.
+
     async def test_audio_render_publish_and_full_export(self):
         content = "Xin chào. Đây là bản thử nghiệm."
         storage.write_text("novel-novel/1.txt", content)
