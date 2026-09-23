@@ -11,13 +11,13 @@ import hashlib
 import logging
 import os
 import re
-import sys
 import tempfile
 import time
 from pathlib import Path
 
 from sqlalchemy import text
 
+from app.audiobook_runtime import SynthRuntime
 from app.audiobooks import (
     MODEL_VERSION,
     VOICES,
@@ -30,6 +30,7 @@ from app.database import SessionLocal, engine
 from app.storage import storage
 
 log = logging.getLogger("audiobook-worker")
+synth_runtime = SynthRuntime()
 
 
 async def run_process(*args, timeout=3600):
@@ -131,16 +132,9 @@ async def render(job):
         tmp = Path(tmp)
         (tmp / "source.txt").write_text(source, encoding="utf-8")
         voice = next(v["modelVoice"] for v in VOICES if v["id"] == job["voiceId"])
-        # Inference is isolated: a hung native runtime can be killed and retried safely.
-        await run_process(
-            os.getenv("AUDIOBOOK_SYNTH_PYTHON", sys.executable),
-            "-m",
-            "app.audiobook_synthesize",
-            str(tmp / "source.txt"),
-            str(tmp / "raw.wav"),
-            voice,
-            timeout=int(os.getenv("AUDIOBOOK_RENDER_TIMEOUT", "3600")),
-        )
+        # Reuse a warm model; a timeout/crash kills only the inference process.
+        started = time.monotonic()
+        await synth_runtime.render(tmp / "source.txt", tmp / "raw.wav", voice)
         await run_process(
             "ffmpeg",
             "-v",
@@ -161,6 +155,14 @@ async def render(job):
             str(tmp / "chapter.m4a"),
         )
         duration = await probe(tmp / "chapter.m4a")
+        elapsed = time.monotonic() - started
+        log.info(
+            "Rendered asset %s: %.1fs audio in %.1fs, RTF %.3f",
+            job["id"],
+            duration,
+            elapsed,
+            elapsed / duration,
+        )
         checksum = await asyncio.to_thread(file_hash, tmp / "chapter.m4a")
         size = (tmp / "chapter.m4a").stat().st_size
         # Lock the chapter while publishing; deleted or changed sources must not publish.
@@ -377,11 +379,12 @@ async def main():
                                 text("""UPDATE "AudioBookAsset" SET status='failed',
                                 error='Không thể tạo audio. Hệ thống sẽ thử lại tối đa 3 lần.',
                                 "retryAt"=NOW()+INTERVAL '5 minutes',"updatedAt"=NOW()
-                                WHERE id=:id"""),
-                                {"id": job["id"]},
+                                WHERE id=:id AND status='rendering' AND attempts=:attempt"""),
+                                {"id": job["id"], "attempt": job["attempts"] + 1},
                             )
                             await db.commit()
                 else:
+                    await synth_runtime.release_if_idle()
                     await export_one()
                     if time.monotonic() - last_cleanup > 3600:
                         await cleanup_orphans()
@@ -395,4 +398,11 @@ async def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+
+    async def run():
+        try:
+            await main()
+        finally:
+            await synth_runtime.close()
+
+    asyncio.run(run())

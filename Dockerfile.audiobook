@@ -1,5 +1,5 @@
 FROM python:3.12-slim
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 HF_HOME=/models AUDIOBOOK_SYNTH_PYTHON=/opt/tts/bin/python
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 AUDIOBOOK_THREADS=1 HF_HOME=/models AUDIOBOOK_SYNTH_PYTHON=/opt/tts/bin/python
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv

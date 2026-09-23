@@ -1,11 +1,14 @@
 """Isolated CPU inference. This module is only installed in the render image."""
 
+import contextlib
 import html
+import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
 import wave
 from pathlib import Path
 
@@ -17,15 +20,10 @@ def normalize(source):
     return source.strip()
 
 
-def main():
-    import numpy as np
+def load_model():
     from huggingface_hub import snapshot_download
     from vieneu import Vieneu
 
-    source, destination, voice = sys.argv[1:]
-    content = normalize(Path(source).read_text(encoding="utf-8"))
-    if not content:
-        raise ValueError("Empty chapter")
     revision = "61b85e3d937fbbacb387714180e8182823512523"
     model_dir = Path(os.environ.get("HF_HOME", "/models")) / ("reader-vieneu-" + revision)
     if not (model_dir / ".complete").is_file():
@@ -73,8 +71,17 @@ def main():
             backend="onnx",
             backbone_repo=str(model_dir),
             onnx_dir=str(model_dir / "onnx_update"),
-            threads=2,
+            threads=int(os.getenv("AUDIOBOOK_THREADS", "1")),
         )
+    return model
+
+
+def synthesize(model, source, destination, voice):
+    import numpy as np
+
+    content = normalize(Path(source).read_text(encoding="utf-8"))
+    if not content:
+        raise ValueError("Empty chapter")
     samples = 0
     with wave.open(destination, "wb") as output:
         output.setnchannels(1)
@@ -89,6 +96,28 @@ def main():
             samples += pcm.size
     if samples == 0:
         raise ValueError("Empty audio")
+
+
+def main():
+    if sys.argv[1:] != ["--serve"]:
+        synthesize(load_model(), *sys.argv[1:])
+        return
+    # stdout is a private JSON-lines protocol; SDK diagnostics go to stderr.
+    with contextlib.redirect_stdout(sys.stderr):
+        started = time.monotonic()
+        model = load_model()
+    print(json.dumps({"ready": True, "loadSeconds": time.monotonic() - started}), flush=True)
+    for line in sys.stdin:
+        request = json.loads(line)
+        started = time.monotonic()
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                synthesize(model, request["source"], request["destination"], request["voice"])
+            print(json.dumps({"ok": True, "renderSeconds": time.monotonic() - started}), flush=True)
+        except Exception:
+            # Do not send source text or library diagnostics into queue metadata.
+            print(json.dumps({"ok": False}), flush=True)
+            raise
 
 
 if __name__ == "__main__":

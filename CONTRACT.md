@@ -183,7 +183,9 @@ V1 device TTS and all existing text/offline endpoints retain their payloads.
   server time. Newer `(occurredAt,eventId)` wins. Response always acknowledges the
   accepted event ID, including an older event that does not move progress.
 
-App downloads use immutable asset files and verified SHA-256/byte lengths. A
-manifest is replaced atomically only after all currently ready chapters download.
-Incomplete files support Range resume. Existing local snapshots play immediately;
-server checks are in the background. Local deletion never deletes server audio.
+Audio book V2 is stream-only on web and app. Clients keep listening progress,
+not persistent audio downloads. The app removes its retired V2 download directory
+on upgrade; text downloads and V1 device TTS remain unchanged. Network failures
+retain playback position and can retry while playback is still requested.
+Whole-book M4B exports remain server-side for future extraction, not as an offline
+library feature. Existing manifest and asset HTTP shapes remain compatible.

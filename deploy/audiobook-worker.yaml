@@ -43,6 +43,12 @@ spec:
               value: /data/content
             - name: HF_HOME
               value: /models
+            - name: AUDIOBOOK_THREADS
+              value: "1"
+            - name: AUDIOBOOK_RECYCLE_CHAPTERS
+              value: "20"
+            - name: AUDIOBOOK_RECYCLE_RSS_MB
+              value: "1800"
             - name: AUDIOBOOK_RENDER_TIMEOUT
               value: "3600"
           resources:

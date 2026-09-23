@@ -9,8 +9,8 @@ import test_offline_sync as legacy
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 
-from app.audiobooks import AudioRequest, ensure_audio_schema, request_audio, edition_manifest
 from app.audiobook_worker import claim, export_one, render
+from app.audiobooks import AudioRequest, edition_manifest, ensure_audio_schema, request_audio
 from app.database import SessionLocal, engine
 from app.main import app
 from app.storage import storage
@@ -68,7 +68,9 @@ class AudioBookTests(legacy.OfflineSyncTests):
         async with SessionLocal() as db:
             await db.execute(
                 text(
-                    """UPDATE "AudioBookAsset" SET status='ready',href='fixture.m4a',sha256='abc',bytes=10,duration=2 WHERE id=:id"""
+                    """UPDATE "AudioBookAsset" SET status='ready',
+                    href='fixture.m4a',sha256='abc',bytes=10,duration=2
+                    WHERE id=:id"""
                 ),
                 {"id": asset},
             )
@@ -126,7 +128,9 @@ class AudioBookTests(legacy.OfflineSyncTests):
             await db.execute(text("DELETE FROM \"ChapterMeta\" WHERE id<>'c1'"))
             await db.execute(
                 text(
-                    """UPDATE "ChapterContentRef" SET "contentHash"=:hash,"txtHref"='novel-novel/1.txt' WHERE "chapterId"='c1' """
+                    """UPDATE "ChapterContentRef" SET "contentHash"=:hash,
+                    "txtHref"='novel-novel/1.txt'
+                    WHERE "chapterId"='c1' """
                 ),
                 {"hash": hashlib.sha256(content.encode()).hexdigest()},
             )
@@ -135,23 +139,20 @@ class AudioBookTests(legacy.OfflineSyncTests):
         job = await claim()
         from app.audiobook_worker import run_process as real_process
 
-        async def process(*args, **kwargs):
-            if "app.audiobook_synthesize" in args:
-                output = args[args.index("app.audiobook_synthesize") + 2]
-                return await real_process(
-                    "ffmpeg",
-                    "-v",
-                    "error",
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:duration=0.3",
-                    output,
-                )
-            return await real_process(*args, **kwargs)
+        async def synth(source, output, voice):
+            await real_process(
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.3",
+                str(output),
+            )
 
-        with patch("app.audiobook_worker.run_process", process):
+        with patch("app.audiobook_worker.synth_runtime.render", synth):
             await render(job)
             self.assertTrue(await export_one())
         async with SessionLocal() as db:

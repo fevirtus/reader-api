@@ -23,8 +23,15 @@ Exports include chapter markers and represent the complete available chapter lis
 at that revision, including unfinished novels. They are rebuilt after the render
 queue drains. Original chapter text paths do not change.
 
-A render subprocess is bounded to one hour and two ONNX threads. It is isolated
-per chapter so a hung native model can be terminated. Model weights are cached on
+A warm inference subprocess is bounded to one hour per request and defaults to
+one ONNX thread (`AUDIOBOOK_THREADS`). It loads the model once and reuses it for
+up to 20 chapters (`AUDIOBOOK_RECYCLE_CHAPTERS`). It is recycled after errors,
+timeouts, or RSS above 1800 MiB (`AUDIOBOOK_RECYCLE_RSS_MB`) between jobs. After ten
+idle minutes it exits to release RAM. A hung native model can still be killed
+without terminating the queue worker. The worker logs model load time, synthesis
+time and audio duration/RTF; compare those on representative chapters before
+raising CPU or concurrency. One global worker remains deliberate on 2-CPU nodes.
+Increasing replica count alone does not increase throughput. Model weights are cached on
 PVC and copied out of Hugging Face blob symlinks for ONNX external-data validation.
 Inference is retried up to three times with five-minute backoff. Failed jobs stay
 visible; operators can reset attempts after fixing the underlying problem.
@@ -42,3 +49,15 @@ Initial storage is served by the API's FileResponse without retaining a DB
 connection during playback. If egress/HTTP load grows, put a file-serving proxy or
 object storage in front using the same immutable asset IDs; no model scaling is
 required for cached listeners.
+
+V2 playback is stream-only. No audio download library is exposed on web/app;
+only transient player buffering and durable listening progress remain. Server
+chapter assets and whole-book exports are retained. Text offline and V1 TTS are
+unchanged. App migration deletes only the retired `audiobooks` support directory.
+
+Initial homelab measurement (2026-09-23, 1.5 CPU quota, same short Vietnamese
+passage, three generations per setting): model startup ~6 seconds, two threads
+~2.02 seconds compute per second audio; one thread ~1.93. Generation is stochastic
+so these are indicative samples, not a whole-chapter SLA. Keep one thread until
+representative longer benchmarks justify increasing it. Warm reuse removes model
+startup between jobs; it does not imply real-time rendering on this CPU.
