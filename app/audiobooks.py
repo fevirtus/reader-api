@@ -167,6 +167,13 @@ async def voices():
 
 @router.get("/novels/{novel_id}")
 async def editions(novel_id: str, db: AsyncSession = Depends(get_db_session)):
+    novel = (
+        (await db.execute(text('SELECT title FROM "Novel" WHERE id=:id'), {"id": novel_id}))
+        .mappings()
+        .first()
+    )
+    if not novel:
+        raise HTTPException(404, "Không tìm thấy truyện")
     rows = (
         (
             await db.execute(
@@ -177,7 +184,11 @@ async def editions(novel_id: str, db: AsyncSession = Depends(get_db_session)):
         .scalars()
         .all()
     )
-    return {"editions": [await edition_manifest(db, eid) for eid in rows]}
+    return {
+        "novelId": novel_id,
+        "title": novel["title"],
+        "editions": [await edition_manifest(db, eid) for eid in rows],
+    }
 
 
 @router.get("/editions/{edition_id}")
