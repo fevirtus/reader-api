@@ -99,7 +99,7 @@ async def claim():
             JOIN "ChapterContentRef" r ON r."chapterId"=c.id
             WHERE a.status IN ('queued','failed') AND a.attempts<3 AND a."retryAt"<=NOW()
             AND a."sourceHash"=r."contentHash" AND a."modelVersion"=:model
-            ORDER BY a.attempts, e."createdAt", c.number LIMIT 1 FOR UPDATE OF a SKIP LOCKED"""),
+            ORDER BY a.attempts, c.number, e."createdAt" LIMIT 1 FOR UPDATE OF a SKIP LOCKED"""),
                     {"model": MODEL_VERSION},
                 )
             )
@@ -352,10 +352,13 @@ async def main():
             raise RuntimeError("Another Audio book worker is active")
         async with SessionLocal() as db:
             await db.execute(
-                text("UPDATE \"AudioBookAsset\" SET status='queued' WHERE status='rendering'")
+                text("""UPDATE "AudioBookAsset" SET status=
+                    CASE WHEN attempts>=3 THEN 'failed' ELSE 'queued' END
+                    WHERE status='rendering' """)
             )
             await db.commit()
         last_reconcile = 0
+        last_cleanup = 0
         while True:
             try:
                 # Detect lost ownership before starting another job.
@@ -380,7 +383,9 @@ async def main():
                             await db.commit()
                 else:
                     await export_one()
-                    await cleanup_orphans()
+                    if time.monotonic() - last_cleanup > 3600:
+                        await cleanup_orphans()
+                        last_cleanup = time.monotonic()
                     await asyncio.sleep(15)
             except Exception:
                 # Exit on loss of DB lock/connection; Kubernetes restarts and reacquires it.
