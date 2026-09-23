@@ -1,0 +1,198 @@
+"""Audio book integration tests on the same explicitly disposable database as sync tests."""
+
+import hashlib
+import tempfile
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import test_offline_sync as legacy
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
+
+from app.audiobooks import AudioRequest, ensure_audio_schema, request_audio, edition_manifest
+from app.audiobook_worker import claim, export_one, render
+from app.database import SessionLocal, engine
+from app.main import app
+from app.storage import storage
+
+
+class AudioBookTests(legacy.OfflineSyncTests):
+    async def asyncSetUp(self):
+        await engine.dispose()
+        async with engine.begin() as c:
+            for name in [
+                "AudioBookProgress",
+                "AudioBookRequest",
+                "AudioBookExport",
+                "AudioBookAsset",
+                "AudioBookEdition",
+            ]:
+                await c.execute(text(f'DROP TABLE IF EXISTS "{name}" CASCADE'))
+        await super().asyncSetUp()
+        async with engine.begin() as c:
+            await c.execute(text('ALTER TABLE "ChapterContentRef" ADD COLUMN "txtHref" TEXT'))
+        await ensure_audio_schema()
+        self.auth = patch(
+            "app.audiobooks.require_current_user", AsyncMock(return_value={"id": "user"})
+        )
+        self.auth.start()
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_root = storage.root
+        storage.root = Path(self.temp.name).resolve()
+
+    async def asyncTearDown(self):
+        self.auth.stop()
+        storage.root = self.old_root
+        self.temp.cleanup()
+        await super().asyncTearDown()
+
+    async def request_book(self, voice="anh-khoi"):
+        async with SessionLocal() as db:
+            return await request_audio("novel", AudioRequest(voiceId=voice), None, db)
+
+    async def test_audio_duplicate_requests_and_parallel_voices(self):
+        first = await self.request_book()
+        second = await self.request_book()
+        other = await self.request_book("ngoc-linh")
+        self.assertEqual(first["id"], second["id"])
+        self.assertNotEqual(first["id"], other["id"])
+        async with SessionLocal() as db:
+            self.assertEqual(
+                (await db.execute(text('SELECT COUNT(*) FROM "AudioBookAsset"'))).scalar_one(), 100
+            )
+
+    async def test_audio_revision_retains_old_file_and_range(self):
+        book = await self.request_book()
+        asset = book["chapters"][0]["requestedAssetId"]
+        (storage.root / "fixture.m4a").write_bytes(b"0123456789")
+        async with SessionLocal() as db:
+            await db.execute(
+                text(
+                    """UPDATE "AudioBookAsset" SET status='ready',href='fixture.m4a',sha256='abc',bytes=10,duration=2 WHERE id=:id"""
+                ),
+                {"id": asset},
+            )
+            old = await edition_manifest(db, book["id"])
+            await db.execute(
+                text(
+                    """UPDATE "ChapterContentRef" SET "contentHash"='new' WHERE "chapterId"='c1' """
+                )
+            )
+            await db.commit()
+        changed = await self.request_book()
+        self.assertTrue(changed["chapters"][0]["hasUpdate"])
+        self.assertEqual(changed["chapters"][0]["assetId"], asset)
+        self.assertEqual(old["revision"], changed["revision"])
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(
+                "/api/audiobooks/assets/" + asset, headers={"Range": "bytes=2-5"}
+            )
+            self.assertEqual(response.status_code, 206)
+            self.assertEqual(response.content, b"2345")
+            self.assertEqual(response.headers["content-range"], "bytes 2-5/10")
+            response = await client.head("/api/audiobooks/assets/" + asset)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.content, b"")
+            self.assertEqual(
+                (
+                    await client.get(
+                        "/api/audiobooks/assets/" + asset, headers={"Range": "bytes=50-"}
+                    )
+                ).status_code,
+                416,
+            )
+
+    async def test_audio_claim_retry_and_chapter_deletion(self):
+        await self.request_book()
+        first, second = await claim(), await claim()
+        self.assertNotEqual(first["id"], second["id"])
+        async with SessionLocal() as db:
+            await db.execute(
+                text('DELETE FROM "ChapterMeta" WHERE id=:id'), {"id": first["chapterId"]}
+            )
+            await db.commit()
+            self.assertIsNone(
+                (
+                    await db.execute(
+                        text('SELECT id FROM "AudioBookAsset" WHERE id=:id'), {"id": first["id"]}
+                    )
+                ).first()
+            )
+
+    async def test_audio_render_publish_and_full_export(self):
+        content = "Xin chào. Đây là bản thử nghiệm."
+        storage.write_text("novel-novel/1.txt", content)
+        async with SessionLocal() as db:
+            await db.execute(text("DELETE FROM \"ChapterMeta\" WHERE id<>'c1'"))
+            await db.execute(
+                text(
+                    """UPDATE "ChapterContentRef" SET "contentHash"=:hash,"txtHref"='novel-novel/1.txt' WHERE "chapterId"='c1' """
+                ),
+                {"hash": hashlib.sha256(content.encode()).hexdigest()},
+            )
+            await db.commit()
+        book = await self.request_book()
+        job = await claim()
+        from app.audiobook_worker import run_process as real_process
+
+        async def process(*args, **kwargs):
+            if "app.audiobook_synthesize" in args:
+                output = args[args.index("app.audiobook_synthesize") + 2]
+                return await real_process(
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:duration=0.3",
+                    output,
+                )
+            return await real_process(*args, **kwargs)
+
+        with patch("app.audiobook_worker.run_process", process):
+            await render(job)
+            self.assertTrue(await export_one())
+        async with SessionLocal() as db:
+            result = await edition_manifest(db, book["id"])
+            self.assertEqual(result["readyCount"], 1)
+            self.assertIsNotNone(result["export"])
+            self.assertFalse(result["export"]["hasUpdate"])
+        self.assertFalse(await export_one())
+
+    async def test_audio_progress_does_not_rewind_or_change_legacy(self):
+        book = await self.request_book()
+        asset = book["chapters"][0]["requestedAssetId"]
+        async with SessionLocal() as db:
+            await db.execute(
+                text("UPDATE \"AudioBookAsset\" SET status='ready',duration=100 WHERE id=:id"),
+                {"id": asset},
+            )
+            await db.commit()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            body = {
+                "editionId": book["id"],
+                "assetId": asset,
+                "position": 50,
+                "eventId": "new",
+                "occurredAt": "2025-01-02T00:00:00Z",
+            }
+            self.assertEqual(
+                (await client.post("/api/audiobooks/progress/novel", json=body)).status_code, 200
+            )
+            body.update(position=5, eventId="old", occurredAt="2025-01-01T00:00:00Z")
+            self.assertEqual(
+                (await client.post("/api/audiobooks/progress/novel", json=body)).json()[
+                    "acknowledgedEventId"
+                ],
+                "old",
+            )
+            self.assertEqual(
+                (await client.get("/api/audiobooks/progress/novel")).json()["progress"]["position"],
+                50,
+            )
+        async with SessionLocal() as db:
+            self.assertEqual(
+                (await db.execute(text('SELECT COUNT(*) FROM "Bookmark"'))).scalar_one(), 0
+            )

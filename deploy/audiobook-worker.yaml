@@ -1,0 +1,66 @@
+# Replace AUDIOBOOK_IMAGE with the verified sha image before applying.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: reader-audiobook-models
+  namespace: reader
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reader-audiobook-worker
+  namespace: reader
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: reader-audiobook-worker
+  template:
+    metadata:
+      labels:
+        app: reader-audiobook-worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        kubernetes.io/hostname: k3s-worker-02
+      containers:
+        - name: worker
+          image: AUDIOBOOK_IMAGE
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: reader-api-env
+          env:
+            - name: NAS_CONTENT_ROOT
+              value: /data/content
+            - name: HF_HOME
+              value: /models
+            - name: AUDIOBOOK_RENDER_TIMEOUT
+              value: "3600"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 1Gi
+            limits:
+              cpu: "1500m"
+              memory: 3Gi
+          volumeMounts:
+            - name: content
+              mountPath: /data/content
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: content
+          persistentVolumeClaim:
+            claimName: reader-content
+        - name: models
+          persistentVolumeClaim:
+            claimName: reader-audiobook-models

@@ -160,3 +160,30 @@ TEST_DATABASE_URL=postgresql+asyncpg://postgres:password@127.0.0.1:55439/reader_
 ```
 Suite chỉ chấp nhận database local tên `reader_sync_test` và tạo lại bảng test;
 không chạy với database có dữ liệu cần giữ.
+
+## Audio book V2
+
+V1 device TTS and all existing text/offline endpoints retain their payloads.
+
+- `GET /api/audiobooks/voices`: enabled voice IDs, names and default selection.
+- `GET /api/audiobooks/novels/{novelId}`: parallel voice editions with manifests.
+- `POST /api/audiobooks/novels/{novelId}/requests` with `{voiceId}`: authenticated,
+  idempotent request (202); up to five new edition requests per user per day.
+- `GET /api/audiobooks/editions/{editionId}`: immutable ready chapter IDs, hashes,
+  byte lengths, durations, current render status and whole-book export metadata.
+  `revision` changes only when the playable chapter snapshot changes. `hasUpdate`
+  indicates a previous playable asset while a new source/model version is pending.
+- `GET|HEAD /api/audiobooks/assets/{assetId}`: public immutable M4A, HTTP Range/ETag.
+- `GET|HEAD /api/audiobooks/exports/{exportId}`: versioned M4B with chapter markers.
+- `GET /api/audiobooks/progress/{novelId}`: authenticated audio progress, separate
+  from text bookmarks/progress.
+- `POST /api/audiobooks/progress/{novelId}`: `{userId?, editionId, assetId, position,
+  eventId, occurredAt}`. Position is in seconds in that asset revision. Optional
+  userId must match the authenticated account; client timestamps are bounded to
+  server time. Newer `(occurredAt,eventId)` wins. Response always acknowledges the
+  accepted event ID, including an older event that does not move progress.
+
+App downloads use immutable asset files and verified SHA-256/byte lengths. A
+manifest is replaced atomically only after all currently ready chapters download.
+Incomplete files support Range resume. Existing local snapshots play immediately;
+server checks are in the background. Local deletion never deletes server audio.

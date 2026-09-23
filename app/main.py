@@ -36,6 +36,7 @@ from app.database import get_db_session
 from app import deepseek
 from app.offline_sync import router as offline_router, ensure_sync_schema, lock_bookmark, record_online_operation
 from app.storage import storage
+from app.audiobooks import router as audiobook_router, ensure_audio_schema
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ async def _ensure_novel_rating_table() -> None:
 async def lifespan(_: FastAPI):
     await _ensure_novel_rating_table()
     await ensure_sync_schema()
+    await ensure_audio_schema()
     if str(settings.auto_schema_bootstrap).lower() in {"1", "true", "yes", "on"}:
         await _ensure_migration_tables()
     yield
@@ -144,6 +146,7 @@ async def _ensure_migration_tables() -> None:
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 app.include_router(offline_router)
+app.include_router(audiobook_router)
 
 
 
