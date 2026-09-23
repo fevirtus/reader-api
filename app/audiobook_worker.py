@@ -265,6 +265,10 @@ async def render(job):
                 )
                 await db.commit()
                 return
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": "audio-file:" + str(destination.relative_to(storage.root))},
+            )
             await asyncio.to_thread(publish_audio, tmp / "chapter.m4a", destination, checksum)
             await db.execute(
                 text("""UPDATE "AudioBookAsset" SET status='ready',href=:href,sha256=:sha,
@@ -451,6 +455,10 @@ async def cleanup_requested():
             ):
                 log.error("Refusing unexpected audio cleanup path")
                 continue
+            await db.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+                {"key": "audio-file:" + href},
+            )
             referenced = (
                 await db.execute(
                     text("""SELECT 1 FROM "AudioBookAsset" WHERE href=:href
@@ -458,9 +466,8 @@ async def cleanup_requested():
                     {"href": href},
                 )
             ).first()
-            if referenced:
-                continue
-            await asyncio.to_thread(storage.delete_href, href)
+            if not referenced:
+                await asyncio.to_thread(storage.delete_href, href)
             await db.execute(
                 text('DELETE FROM "AudioBookGarbage" WHERE href=:href'), {"href": href}
             )
