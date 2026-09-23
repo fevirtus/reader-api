@@ -439,7 +439,8 @@ async def main():
                     await synth_runtime.release_if_idle()
                     if not preview_work:
                         await export_one()
-                    if time.monotonic() - last_cleanup > 3600:
+                    # A large NAS scan must not delay bootstrapping the voice catalogue.
+                    if not preview_work and time.monotonic() - last_cleanup > 3600:
                         await cleanup_orphans()
                         last_cleanup = time.monotonic()
                     await asyncio.sleep(0 if preview_work else 15)
